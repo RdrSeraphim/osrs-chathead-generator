@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "start": "node dist/server.mjs",
     "test": "vitest run",
-    "fetch-cache": "tsx scripts/fetch-openrs2-cache.ts"
+    "fetch-cache": "tsx scripts/fetch-openrs2-cache.ts",
+    "generate-og-image": "tsx scripts/generate-og-image.ts"
   },
   "dependencies": {
     "@abextm/cache2": "^0.1.11",

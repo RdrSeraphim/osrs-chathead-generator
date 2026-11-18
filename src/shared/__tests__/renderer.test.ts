@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { Readable } from 'node:stream';
 import { buildStarterCache } from '../cache/StarterCacheBuilder';
@@ -21,6 +22,7 @@ import {
 } from '../renderer/SoftwareRasterizer';
 import { NodeFileMapProvider } from '../../server/NodeFileProvider';
 import { osrsApiPlugin } from '../../server/apiPlugin';
+import { applySocialMetaUrls, resolvePublicOrigin } from '../../server/socialMeta';
 import { FONT_QUILL_8, measureBitmapText, wrapBitmapText } from '../constants/bitmapFonts';
 
 function createApiMiddlewareInvoker() {
@@ -666,5 +668,64 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
     // Sibling prefix escape attempt must fail containment check
     const provider = new NodeFileMapProvider(path.resolve(process.cwd(), 'cache'));
     await expect(provider.getFile('../cache-other/secret')).resolves.toBeUndefined();
+  });
+
+  it('provides Open Graph / Twitter Card metadata, valid 1200x630 preview PNG, and safe absolute origin rewriting', async () => {
+    const ogPngPath = path.resolve(process.cwd(), 'public', 'og-image.png');
+    const pngBytes = await fs.readFile(ogPngPath);
+    expect(Array.from(pngBytes.subarray(0, 8))).toEqual([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const ihdrView = new DataView(pngBytes.buffer, pngBytes.byteOffset + 16, 8);
+    expect(ihdrView.getUint32(0, false)).toBe(1200);
+    expect(ihdrView.getUint32(4, false)).toBe(630);
+
+    const indexHtml = await fs.readFile(path.resolve(process.cwd(), 'index.html'), 'utf8');
+    for (const marker of [
+      'property="og:type"',
+      'property="og:title"',
+      'property="og:description"',
+      'property="og:image"',
+      'property="og:image:width"',
+      'property="og:image:height"',
+      'name="twitter:card"',
+      'name="twitter:title"',
+      'name="twitter:description"',
+      'name="twitter:image"',
+    ]) {
+      expect(indexHtml).toContain(marker);
+    }
+
+    expect(
+      resolvePublicOrigin(
+        { host: 'internal:5173', 'x-forwarded-proto': 'http', 'x-forwarded-host': 'ignored.example' },
+        { publicUrl: 'https://chathead.example.com/app/', trustProxy: false }
+      )
+    ).toBe('https://chathead.example.com');
+
+    expect(
+      resolvePublicOrigin(
+        { host: 'internal:5173', 'x-forwarded-proto': 'https', 'x-forwarded-host': 'proxy.example.com' },
+        { publicUrl: '', trustProxy: true }
+      )
+    ).toBe('https://proxy.example.com');
+
+    expect(
+      resolvePublicOrigin(
+        { host: 'direct.example.com:5173', 'x-forwarded-proto': 'https', 'x-forwarded-host': 'spoofed.example.com' },
+        { publicUrl: '', trustProxy: false }
+      )
+    ).toBe('http://direct.example.com:5173');
+
+    expect(
+      resolvePublicOrigin(
+        { host: 'evil.com"><script>' },
+        { publicUrl: '', trustProxy: false }
+      )
+    ).toBeNull();
+
+    const rewritten = applySocialMetaUrls(indexHtml, 'https://osrs.example.com');
+    expect(rewritten).toContain('<meta property="og:image" content="https://osrs.example.com/og-image.png" />');
+    expect(rewritten).toContain('<meta name="twitter:image" content="https://osrs.example.com/og-image.png" />');
+    expect(rewritten).toContain('<meta property="og:url" content="https://osrs.example.com/" />');
+    expect(rewritten).toContain('<link rel="canonical" href="https://osrs.example.com/" />');
   });
 });

@@ -85,7 +85,8 @@ OSRS_ADMIN_TOKEN="change-this-secret" docker compose up -d --build
 | --- | --- | --- |
 | `OSRS_ADMIN_TOKEN` | _(unset)_ | Secret token checked via `X-OSRS-Admin-Token` (`timingSafeEqual`) for `POST /api/cache/load-path` and `POST /api/cache/download-openrs2`. When unset, only direct non-proxied loopback requests are permitted. Can be saved in browser `localStorage` (`osrs_admin_token`) under **Server Admin (Self-Hosted)**. |
 | `OSRS_ALLOW_HOST_CACHES` | `0` | Opt-in flag (`1`) allowing local `~/jagexcache/oldschool/LIVE` and `~/.runelite/jagexcache/oldschool/LIVE` directories on the server allowlist for single-user local setups. Keep `0` in Docker and public deployments. |
-| `TRUST_PROXY` | `0` | Set to `1` behind a trusted reverse proxy (Caddy, nginx, Cloudflare) so per-IP rate limiting reads `CF-Connecting-IP` / `X-Forwarded-For` instead of bucketing all visitors under the proxy's socket IP. |
+| `TRUST_PROXY` | `0` | Set to `1` behind a trusted reverse proxy (Caddy, nginx, Cloudflare) so per-IP rate limiting reads `CF-Connecting-IP` / `X-Forwarded-For` instead of bucketing all visitors under the proxy's socket IP, and social metadata fallback reads `X-Forwarded-Proto` / `X-Forwarded-Host`. |
+| `PUBLIC_URL` | _(unset)_ | Canonical public origin (e.g. `https://chathead.example.com`) used to rewrite Open Graph / Twitter Card `og:url`, `og:image`, and `twitter:image` URLs in `dist/index.html` when served by `prodServer.ts`. When unset, `prodServer.ts` derives it from `Host` (or `X-Forwarded-Proto` / `X-Forwarded-Host` when `TRUST_PROXY=1`). |
 | `HOST` / `PORT` | `0.0.0.0` / `5173` | Bind host and port for `node dist/server.mjs`. |
 
 When deploying publicly behind a reverse proxy, set both `OSRS_ADMIN_TOKEN` and `TRUST_PROXY=1`.

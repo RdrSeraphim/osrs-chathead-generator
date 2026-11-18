@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as http from 'node:http';
 import * as path from 'node:path';
 import { createApiMiddleware } from './apiPlugin';
+import { applySocialMetaUrls, resolvePublicOrigin } from './socialMeta';
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -93,8 +94,12 @@ async function startProdServer(): Promise<void> {
         return;
       }
 
-      const data = await fs.readFile(filePath);
+      let data = await fs.readFile(filePath);
       const ext = path.extname(filePath).toLowerCase();
+      if (ext === '.html') {
+        const origin = resolvePublicOrigin(req.headers);
+        data = Buffer.from(applySocialMetaUrls(data.toString('utf8'), origin), 'utf8');
+      }
       res.statusCode = 200;
       res.setHeader('Content-Type', MIME_TYPES[ext] ?? 'application/octet-stream');
       res.setHeader('Content-Length', String(data.length));
