@@ -23,6 +23,71 @@ import { NodeFileMapProvider } from '../../server/NodeFileProvider';
 import { osrsApiPlugin } from '../../server/apiPlugin';
 import { FONT_QUILL_8, measureBitmapText, wrapBitmapText } from '../constants/bitmapFonts';
 
+function createApiMiddlewareInvoker() {
+  type MiddlewareFn = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    next: (err?: unknown) => void
+  ) => Promise<void> | void;
+
+  let middleware: MiddlewareFn | null = null;
+  const plugin = osrsApiPlugin();
+  const configureServer = plugin.configureServer as unknown as (server: {
+    middlewares: { use: (fn: MiddlewareFn) => void };
+  }) => void;
+  configureServer({
+    middlewares: {
+      use: (fn) => {
+        middleware = fn;
+      },
+    },
+  });
+  expect(middleware).not.toBeNull();
+
+  return async (
+    method: string,
+    reqUrl: string,
+    headers: Record<string, string> = {},
+    body?: Uint8Array | string
+  ) => {
+    const rawBuf =
+      body === undefined
+        ? undefined
+        : typeof body === 'string'
+          ? Buffer.from(body, 'utf8')
+          : Buffer.from(body);
+    const stream = Readable.from(rawBuf ? [rawBuf] : []);
+    const req = Object.assign(stream, {
+      method,
+      url: reqUrl,
+      headers,
+    }) as unknown as IncomingMessage;
+
+    const resHeaders = new Map<string, string>();
+    let endedBody: Uint8Array = new Uint8Array(0);
+    const res = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => {
+        resHeaders.set(k.toLowerCase(), String(v));
+      },
+      end: (chunk?: Buffer | Uint8Array | string) => {
+        if (chunk !== undefined) {
+          endedBody =
+            typeof chunk === 'string'
+              ? new TextEncoder().encode(chunk)
+              : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        }
+      },
+    } as unknown as ServerResponse;
+
+    await middleware!(req, res, () => {
+      throw new Error(`Unexpected next() for ${reqUrl}`);
+    });
+
+    return { statusCode: res.statusCode, headers: resHeaders, body: Buffer.from(endedBody) };
+  };
+}
+
 function countOpaquePixels(raster: {
   pixels: Uint8ClampedArray;
   width: number;
@@ -530,62 +595,7 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
   });
 
   it('publishes and serves preview GIFs via HTTP /api/preview-image/:variant', async () => {
-    type MiddlewareFn = (
-      req: IncomingMessage,
-      res: ServerResponse,
-      next: (err?: unknown) => void
-    ) => Promise<void> | void;
-
-    let middleware: MiddlewareFn | null = null;
-    const plugin = osrsApiPlugin();
-    const configureServer = plugin.configureServer as unknown as (server: {
-      middlewares: { use: (fn: MiddlewareFn) => void };
-    }) => void;
-    configureServer({
-      middlewares: {
-        use: (fn) => {
-          middleware = fn;
-        },
-      },
-    });
-    expect(middleware).not.toBeNull();
-
-    const invokeMiddleware = async (
-      method: string,
-      reqUrl: string,
-      headers: Record<string, string>,
-      body?: Uint8Array
-    ) => {
-      const stream = Readable.from(body ? [Buffer.from(body)] : []);
-      const req = Object.assign(stream, {
-        method,
-        url: reqUrl,
-        headers,
-      }) as unknown as IncomingMessage;
-
-      const resHeaders = new Map<string, string>();
-      let endedBody: Uint8Array = new Uint8Array(0);
-      const res = {
-        statusCode: 200,
-        setHeader: (k: string, v: string) => {
-          resHeaders.set(k.toLowerCase(), String(v));
-        },
-        end: (chunk?: Buffer | Uint8Array | string) => {
-          if (chunk !== undefined) {
-            endedBody =
-              typeof chunk === 'string'
-                ? new TextEncoder().encode(chunk)
-                : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-          }
-        },
-      } as unknown as ServerResponse;
-
-      await middleware!(req, res, () => {
-        throw new Error(`Unexpected next() for ${reqUrl}`);
-      });
-
-      return { statusCode: res.statusCode, headers: resHeaders, body: Buffer.from(endedBody) };
-    };
+    const invokeMiddleware = createApiMiddlewareInvoker();
 
     const sampleGif = Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x3b]);
     const postRes = await invokeMiddleware(
@@ -610,6 +620,8 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
     expect(getRes.headers.get('content-type')).toBe('image/gif');
     expect(getRes.headers.get('cache-control')).toBe('public, max-age=3600, immutable');
     expect(getRes.headers.get('accept-ranges')).toBe('bytes');
+    expect(getRes.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(getRes.headers.get('content-security-policy')).toBe("default-src 'none'");
     expect(new Uint8Array(getRes.body)).toEqual(sampleGif);
 
     const headRes = await invokeMiddleware('HEAD', postJson.url, {});
@@ -617,9 +629,58 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
     expect(headRes.headers.get('content-type')).toBe('image/gif');
     expect(headRes.headers.get('content-length')).toBe(String(sampleGif.length));
     expect(headRes.headers.get('cache-control')).toBe('public, max-age=3600, immutable');
+    expect(headRes.headers.get('x-content-type-options')).toBe('nosniff');
     expect(headRes.body.length).toBe(0);
 
     const wrongExtRes = await invokeMiddleware('GET', '/api/preview-image/regular.png', {});
     expect(wrongExtRes.statusCode).toBe(404);
+  });
+
+  it('enforces API security: blocks path traversal, cross-origin POSTs, and invalid image magic bytes', async () => {
+    const invokeMiddleware = createApiMiddlewareInvoker();
+
+    const statusRes = await invokeMiddleware('GET', '/api/cache/status');
+    expect(statusRes.statusCode).toBe(200);
+    const statusJson = JSON.parse(statusRes.body.toString('utf8')) as {
+      activePath: string;
+      candidateDirs: string[];
+    };
+    expect(statusJson.activePath).toBe('./cache');
+    expect(statusJson.activePath).not.toContain('/home/');
+    for (const dir of statusJson.candidateDirs) {
+      expect(dir).not.toContain('/home/');
+    }
+
+    const etcRes = await invokeMiddleware(
+      'POST',
+      '/api/cache/load-path',
+      { 'content-type': 'application/json' },
+      JSON.stringify({ dirPath: '/etc' })
+    );
+    expect(etcRes.statusCode).toBe(403);
+
+    const relRes = await invokeMiddleware(
+      'POST',
+      '/api/cache/load-path',
+      { 'content-type': 'application/json' },
+      JSON.stringify({ dirPath: '../../etc' })
+    );
+    expect(relRes.statusCode).toBe(403);
+
+    const crossSiteRes = await invokeMiddleware(
+      'POST',
+      '/api/preview-image/regular?token=bad&mime=image/gif',
+      { 'content-type': 'image/gif', 'sec-fetch-site': 'cross-site' },
+      Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+    );
+    expect(crossSiteRes.statusCode).toBe(403);
+
+    const badMagicRes = await invokeMiddleware(
+      'POST',
+      '/api/preview-image/regular?token=badmagic&mime=image/gif',
+      { 'content-type': 'image/gif' },
+      Uint8Array.from([0xde, 0xad, 0xbe, 0xef])
+    );
+    expect(badMagicRes.statusCode).toBe(400);
   });
 });

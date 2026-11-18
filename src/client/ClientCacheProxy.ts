@@ -10,7 +10,7 @@ import {
   SeqDef,
   UnifiedCache,
 } from '../shared/cache/types';
-import { normalizeRelPath, OsrsUnifiedCache } from '../shared/cache/UnifiedCacheLoader';
+import { MemoryFileMapProvider, normalizeRelPath, OsrsUnifiedCache } from '../shared/cache/UnifiedCacheLoader';
 import { CompatibleSeqEntry } from '../shared/renderer/ChatheadPipeline';
 
 /**
@@ -55,6 +55,287 @@ export async function openBrowserCacheFromFiles(
 ): Promise<OsrsUnifiedCache> {
   const provider = new LazyBrowserFileMapProvider(fileList);
   return OsrsUnifiedCache.open(provider, label);
+}
+
+const OSRS_ADMIN_TOKEN_KEY = 'osrs_admin_token';
+const OSRS_LOCAL_CACHE_META_KEY = 'osrs_local_cache_meta_v1';
+const OSRS_LOCAL_CACHE_DATA_KEY = 'osrs_local_cache_data_v1';
+const OSRS_IDB_NAME = 'osrs_local_cache_db_v1';
+const OSRS_IDB_STORE = 'files';
+const LOCAL_STORAGE_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+
+interface SavedBrowserCacheMeta {
+  label: string;
+  savedAt: number;
+  storage: 'localStorage' | 'indexedDB';
+  fileNames: string[];
+}
+
+export interface BrowserCacheSummaryMeta {
+  label: string;
+  savedAt: number;
+  fileCount: number;
+}
+
+export function getAdminToken(): string {
+  try {
+    return typeof localStorage !== 'undefined' ? (localStorage.getItem(OSRS_ADMIN_TOKEN_KEY) ?? '') : '';
+  } catch {
+    return '';
+  }
+}
+
+export function setAdminToken(token: string): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const trimmed = token.trim();
+    if (trimmed) localStorage.setItem(OSRS_ADMIN_TOKEN_KEY, trimmed);
+    else localStorage.removeItem(OSRS_ADMIN_TOKEN_KEY);
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function openCacheDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined') {
+      reject(new Error('IndexedDB is unavailable in this browser.'));
+      return;
+    }
+    const req = indexedDB.open(OSRS_IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(OSRS_IDB_STORE)) {
+        db.createObjectStore(OSRS_IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error ?? new Error('Failed to open IndexedDB cache store.'));
+  });
+}
+
+async function writeFilesToIndexedDb(entries: Map<string, Uint8Array>): Promise<void> {
+  const db = await openCacheDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(OSRS_IDB_STORE, 'readwrite');
+      const store = tx.objectStore(OSRS_IDB_STORE);
+      store.clear();
+      for (const [name, data] of entries.entries()) {
+        store.put(data, name);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error('IndexedDB write failed.'));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function readFilesFromIndexedDb(fileNames: string[]): Promise<Array<[string, Uint8Array]>> {
+  const db = await openCacheDb();
+  try {
+    return await new Promise<Array<[string, Uint8Array]>>((resolve, reject) => {
+      const tx = db.transaction(OSRS_IDB_STORE, 'readonly');
+      const store = tx.objectStore(OSRS_IDB_STORE);
+      const out: Array<[string, Uint8Array]> = [];
+      let pending = fileNames.length;
+      if (pending === 0) {
+        resolve(out);
+        return;
+      }
+      for (const name of fileNames) {
+        const req = store.get(name);
+        req.onsuccess = () => {
+          const val = req.result;
+          if (val instanceof Uint8Array) {
+            out.push([name, val]);
+          } else if (val instanceof ArrayBuffer) {
+            out.push([name, new Uint8Array(val)]);
+          }
+          pending--;
+          if (pending === 0) resolve(out);
+        };
+        req.onerror = () => reject(req.error ?? new Error(`IndexedDB read failed for ${name}`));
+      }
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function clearIndexedDb(): Promise<void> {
+  if (typeof indexedDB === 'undefined') return;
+  try {
+    const db = await openCacheDb();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(OSRS_IDB_STORE, 'readwrite');
+        tx.objectStore(OSRS_IDB_STORE).clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error ?? new Error('IndexedDB clear failed.'));
+      });
+    } finally {
+      db.close();
+    }
+  } catch {
+    // ignore cleanup failures
+  }
+}
+
+function readSavedMetaRaw(): SavedBrowserCacheMeta | null {
+  try {
+    if (typeof localStorage === 'undefined') return null;
+    const raw = localStorage.getItem(OSRS_LOCAL_CACHE_META_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SavedBrowserCacheMeta>;
+    if (
+      typeof parsed.label !== 'string' ||
+      (parsed.storage !== 'localStorage' && parsed.storage !== 'indexedDB') ||
+      !Array.isArray(parsed.fileNames)
+    ) {
+      return null;
+    }
+    return {
+      label: parsed.label,
+      savedAt: typeof parsed.savedAt === 'number' ? parsed.savedAt : Date.now(),
+      storage: parsed.storage,
+      fileNames: parsed.fileNames.filter((n): n is string => typeof n === 'string'),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function getSavedBrowserCacheMeta(): BrowserCacheSummaryMeta | null {
+  const meta = readSavedMetaRaw();
+  if (!meta || meta.fileNames.length === 0) return null;
+  return {
+    label: meta.label,
+    savedAt: meta.savedAt,
+    fileCount: meta.fileNames.length,
+  };
+}
+
+export async function saveBrowserCacheFiles(
+  fileList: FileList | File[],
+  label = 'Browser Folder'
+): Promise<OsrsUnifiedCache> {
+  const entries = new Map<string, Uint8Array>();
+  let totalBytes = 0;
+
+  for (const file of Array.from(fileList)) {
+    const rel = normalizeRelPath(
+      (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+    );
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    entries.set(rel, bytes);
+    totalBytes += bytes.length;
+  }
+
+  // Validate and open the cache before overwriting any existing persisted browser cache
+  const opened = await OsrsUnifiedCache.open(new MemoryFileMapProvider(entries), label);
+  const fileNames = Array.from(entries.keys());
+  let storageKind: 'localStorage' | 'indexedDB' = 'indexedDB';
+
+  if (typeof localStorage !== 'undefined' && totalBytes <= LOCAL_STORAGE_CACHE_MAX_BYTES) {
+    try {
+      const encoded: Record<string, string> = {};
+      for (const [name, bytes] of entries.entries()) {
+        encoded[name] = bytesToBase64(bytes);
+      }
+      localStorage.setItem(OSRS_LOCAL_CACHE_DATA_KEY, JSON.stringify(encoded));
+      storageKind = 'localStorage';
+      await clearIndexedDb();
+    } catch {
+      storageKind = 'indexedDB';
+    }
+  }
+
+  if (storageKind === 'indexedDB') {
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(OSRS_LOCAL_CACHE_DATA_KEY);
+    } catch {
+      // ignore
+    }
+    await writeFilesToIndexedDb(entries).catch(() => undefined);
+  }
+
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const meta: SavedBrowserCacheMeta = {
+        label,
+        savedAt: Date.now(),
+        storage: storageKind,
+        fileNames,
+      };
+      localStorage.setItem(OSRS_LOCAL_CACHE_META_KEY, JSON.stringify(meta));
+    }
+  } catch {
+    // ignore meta storage failure if browser quota is disabled
+  }
+
+  return opened;
+}
+
+export async function restoreSavedBrowserCache(): Promise<OsrsUnifiedCache | null> {
+  const meta = readSavedMetaRaw();
+  if (!meta || meta.fileNames.length === 0) return null;
+
+  try {
+    let entries: Array<[string, Uint8Array]> = [];
+    if (meta.storage === 'localStorage') {
+      const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(OSRS_LOCAL_CACHE_DATA_KEY) : null;
+      if (!raw) {
+        await clearSavedBrowserCache();
+        return null;
+      }
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      entries = Object.entries(parsed).map(([name, b64]) => [name, base64ToBytes(b64)]);
+    } else {
+      entries = await readFilesFromIndexedDb(meta.fileNames);
+    }
+
+    if (entries.length === 0) {
+      await clearSavedBrowserCache();
+      return null;
+    }
+
+    return await OsrsUnifiedCache.open(new MemoryFileMapProvider(entries), meta.label);
+  } catch {
+    await clearSavedBrowserCache();
+    return null;
+  }
+}
+
+export async function clearSavedBrowserCache(): Promise<void> {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(OSRS_LOCAL_CACHE_META_KEY);
+      localStorage.removeItem(OSRS_LOCAL_CACHE_DATA_KEY);
+    }
+  } catch {
+    // ignore
+  }
+  await clearIndexedDb();
 }
 
 interface SerializedModel {

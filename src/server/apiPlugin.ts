@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -18,16 +19,26 @@ import { NodeFileMapProvider } from './NodeFileProvider';
 interface ServerCacheState {
   cache: UnifiedCache | null;
   activePath: string;
+  activeLabel: string;
   activeMtimeMs: number;
   lastError: string | null;
 }
 
+const DEFAULT_CACHE_LABEL = './cache';
+
 const state: ServerCacheState = {
   cache: null,
   activePath: path.resolve(process.cwd(), 'cache'),
+  activeLabel: DEFAULT_CACHE_LABEL,
   activeMtimeMs: 0,
   lastError: null,
 };
+
+interface AllowedCacheDir {
+  id: string;
+  label: string;
+  realPath: string;
+}
 
 async function getMarkerMtimeMs(dir: string): Promise<number> {
   for (const name of ['main_file_cache.dat2', 'main_file_cache.dat', '0.flatcache']) {
@@ -43,8 +54,9 @@ async function getMarkerMtimeMs(dir: string): Promise<number> {
 
 async function ensureDefaultCacheLoaded(): Promise<UnifiedCache | null> {
   const defaultDir = path.resolve(process.cwd(), 'cache');
+  const resolvedDefault = await fs.realpath(defaultDir).catch(() => defaultDir);
   if (state.cache) {
-    if (state.activePath === defaultDir) {
+    if (state.activePath === resolvedDefault || state.activePath === defaultDir) {
       const mtime = await getMarkerMtimeMs(defaultDir);
       if (mtime > 0 && mtime !== state.activeMtimeMs) {
         state.cache = null;
@@ -55,9 +67,11 @@ async function ensureDefaultCacheLoaded(): Promise<UnifiedCache | null> {
 
   try {
     await fs.access(defaultDir);
-    state.cache = await OsrsUnifiedCache.open(new NodeFileMapProvider(defaultDir), defaultDir);
-    state.activePath = defaultDir;
-    state.activeMtimeMs = await getMarkerMtimeMs(defaultDir);
+    const realDefault = await fs.realpath(defaultDir);
+    state.cache = await OsrsUnifiedCache.open(new NodeFileMapProvider(realDefault), DEFAULT_CACHE_LABEL);
+    state.activePath = realDefault;
+    state.activeLabel = DEFAULT_CACHE_LABEL;
+    state.activeMtimeMs = await getMarkerMtimeMs(realDefault);
     state.lastError = null;
     return state.cache;
   } catch {
@@ -68,8 +82,11 @@ async function ensureDefaultCacheLoaded(): Promise<UnifiedCache | null> {
       for (const [name, bytes] of built.dat2Files.entries()) {
         await fs.writeFile(path.join(defaultDir, name), bytes);
       }
-      state.cache = await OsrsUnifiedCache.open(new NodeFileMapProvider(defaultDir), defaultDir);
-      state.activePath = defaultDir;
+      const realDefault = await fs.realpath(defaultDir);
+      state.cache = await OsrsUnifiedCache.open(new NodeFileMapProvider(realDefault), DEFAULT_CACHE_LABEL);
+      state.activePath = realDefault;
+      state.activeLabel = DEFAULT_CACHE_LABEL;
+      state.activeMtimeMs = await getMarkerMtimeMs(realDefault);
       state.lastError = null;
       return state.cache;
     } catch (err) {
@@ -79,22 +96,40 @@ async function ensureDefaultCacheLoaded(): Promise<UnifiedCache | null> {
   }
 }
 
-async function detectCandidateCacheDirs(): Promise<string[]> {
-  const candidates = [
-    path.resolve(process.cwd(), 'cache'),
-    path.join(os.homedir(), 'jagexcache', 'oldschool', 'LIVE'),
-    path.join(os.homedir(), '.runelite', 'jagexcache', 'oldschool', 'LIVE'),
+async function getAllowedCacheDirs(): Promise<AllowedCacheDir[]> {
+  const candidates: Array<{ id: string; label: string; dir: string }> = [
+    { id: 'default', label: DEFAULT_CACHE_LABEL, dir: path.resolve(process.cwd(), 'cache') },
   ];
-  const existing: string[] = [];
-  for (const dir of candidates) {
+
+  // Host Jagex/RuneLite cache directories are opt-in for private single-user deployments only
+  if (process.env.OSRS_ALLOW_HOST_CACHES === '1') {
+    candidates.push(
+      {
+        id: 'jagexcache',
+        label: '~/jagexcache/oldschool/LIVE',
+        dir: path.join(os.homedir(), 'jagexcache', 'oldschool', 'LIVE'),
+      },
+      {
+        id: 'runelite',
+        label: '~/.runelite/jagexcache/oldschool/LIVE',
+        dir: path.join(os.homedir(), '.runelite', 'jagexcache', 'oldschool', 'LIVE'),
+      }
+    );
+  }
+
+  const allowed: AllowedCacheDir[] = [];
+  for (const item of candidates) {
     try {
-      const stat = await fs.stat(dir);
-      if (stat.isDirectory()) existing.push(dir);
+      const realPath = await fs.realpath(item.dir);
+      const stat = await fs.stat(realPath);
+      if (stat.isDirectory()) {
+        allowed.push({ id: item.id, label: item.label, realPath });
+      }
     } catch {
-      // ignore missing
+      // ignore missing/unreadable candidate
     }
   }
-  return existing;
+  return allowed;
 }
 
 type PreviewVariant = 'regular' | 'full' | 'chatbox';
@@ -106,20 +141,140 @@ interface StoredPreviewImage {
 }
 
 const ALLOWED_PREVIEW_VARIANTS = new Set<PreviewVariant>(['regular', 'full', 'chatbox']);
-const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
+const MAX_PREVIEW_BYTES = 12 * 1024 * 1024;
+const MAX_TOTAL_PREVIEW_BYTES = 48 * 1024 * 1024;
 const MAX_PREVIEW_FILES = 60;
 const previewImages = new Map<PreviewVariant, StoredPreviewImage>();
 const previewFilesByName = new Map<string, { bytes: Uint8Array; mime: 'image/gif' | 'image/png' }>();
+let totalPreviewBytes = 0;
+
+const rateLimitBuckets = new Map<string, number[]>();
+
+function checkRateLimit(ip: string, bucket: string, maxReqs: number, windowMs: number): boolean {
+  const now = Date.now();
+  const key = `${bucket}:${ip}`;
+  const cutoff = now - windowMs;
+  const timestamps = (rateLimitBuckets.get(key) ?? []).filter((t) => t > cutoff);
+  if (timestamps.length >= maxReqs) {
+    rateLimitBuckets.set(key, timestamps);
+    return false;
+  }
+  timestamps.push(now);
+  if (!rateLimitBuckets.has(key) && rateLimitBuckets.size >= 1000) {
+    const oldestKey = rateLimitBuckets.keys().next().value;
+    if (oldestKey !== undefined) rateLimitBuckets.delete(oldestKey);
+  }
+  rateLimitBuckets.set(key, timestamps);
+  return true;
+}
+
+function getClientIp(req: IncomingMessage): string {
+  return req.socket?.remoteAddress || 'local';
+}
+
+function isSameOriginRequest(req: IncomingMessage): boolean {
+  const headers = req.headers ?? {};
+  const secFetchSiteRaw = headers['sec-fetch-site'];
+  const secFetchSite =
+    typeof secFetchSiteRaw === 'string' ? secFetchSiteRaw.trim().toLowerCase() : '';
+  if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+    return false;
+  }
+
+  const originRaw = headers.origin;
+  if (typeof originRaw === 'string' && originRaw.trim()) {
+    if (originRaw.trim() === 'null') return false;
+    try {
+      const originHost = new URL(originRaw).host.toLowerCase();
+      const hostRaw = headers.host;
+      const reqHost = typeof hostRaw === 'string' ? hostRaw.trim().toLowerCase() : '';
+      if (reqHost && originHost !== reqHost) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isLoopbackRequest(req: IncomingMessage): boolean {
+  const headers = req.headers ?? {};
+  if (headers['x-forwarded-for'] || headers.forwarded) {
+    return false;
+  }
+  const remote = req.socket?.remoteAddress;
+  return (
+    remote === undefined ||
+    remote === '127.0.0.1' ||
+    remote === '::1' ||
+    remote === '::ffff:127.0.0.1'
+  );
+}
+
+function isAdminAuthorized(req: IncomingMessage): boolean {
+  const configuredToken = process.env.OSRS_ADMIN_TOKEN?.trim();
+  if (configuredToken) {
+    const rawHeader = req.headers?.['x-osrs-admin-token'];
+    const provided = typeof rawHeader === 'string' ? rawHeader.trim() : '';
+    if (!provided) return false;
+    const expectedBuf = Buffer.from(configuredToken, 'utf8');
+    const providedBuf = Buffer.from(provided, 'utf8');
+    return (
+      expectedBuf.length === providedBuf.length && timingSafeEqual(expectedBuf, providedBuf)
+    );
+  }
+  return isLoopbackRequest(req);
+}
+
+function hasValidImageMagicBytes(bytes: Uint8Array, mime: 'image/gif' | 'image/png'): boolean {
+  if (mime === 'image/gif') {
+    if (bytes.length < 6) return false;
+    const hdr = String.fromCharCode(
+      bytes[0],
+      bytes[1],
+      bytes[2],
+      bytes[3],
+      bytes[4],
+      bytes[5]
+    );
+    return hdr === 'GIF87a' || hdr === 'GIF89a';
+  }
+  return (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  );
+}
 
 function storePreviewFile(
   filename: string,
   file: { bytes: Uint8Array; mime: 'image/gif' | 'image/png' }
 ): void {
-  if (!previewFilesByName.has(filename) && previewFilesByName.size >= MAX_PREVIEW_FILES) {
-    const oldest = previewFilesByName.keys().next().value;
-    if (oldest !== undefined) previewFilesByName.delete(oldest);
+  const existing = previewFilesByName.get(filename);
+  if (existing) {
+    totalPreviewBytes = Math.max(0, totalPreviewBytes - existing.bytes.length);
+    previewFilesByName.delete(filename);
+  }
+  while (
+    previewFilesByName.size >= MAX_PREVIEW_FILES ||
+    (previewFilesByName.size > 0 && totalPreviewBytes + file.bytes.length > MAX_TOTAL_PREVIEW_BYTES)
+  ) {
+    const oldest = previewFilesByName.entries().next().value as
+      | [string, { bytes: Uint8Array; mime: 'image/gif' | 'image/png' }]
+      | undefined;
+    if (!oldest) break;
+    totalPreviewBytes = Math.max(0, totalPreviewBytes - oldest[1].bytes.length);
+    previewFilesByName.delete(oldest[0]);
   }
   previewFilesByName.set(filename, file);
+  totalPreviewBytes += file.bytes.length;
 }
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
@@ -195,15 +350,20 @@ export function osrsApiPlugin(): Plugin {
 
         const url = new URL(req.url, 'http://localhost');
         const pathname = url.pathname;
+        const clientIp = getClientIp(req);
 
         try {
+          if (req.method === 'POST' && !isSameOriginRequest(req)) {
+            return sendJson(res, 403, { error: 'Cross-origin POST requests are not allowed.' });
+          }
+
           if (pathname === '/api/cache/status' && req.method === 'GET') {
             const cache = await ensureDefaultCacheLoaded();
             const summary = cache ? await cache.getSummary() : null;
-            const candidateDirs = await detectCandidateCacheDirs();
+            const candidateDirs = (await getAllowedCacheDirs()).map((c) => c.label);
             return sendJson(res, 200, {
               loaded: Boolean(cache),
-              activePath: state.activePath,
+              activePath: state.activeLabel,
               summary,
               candidateDirs,
               error: state.lastError,
@@ -211,25 +371,49 @@ export function osrsApiPlugin(): Plugin {
           }
 
           if (pathname === '/api/cache/load-path' && req.method === 'POST') {
+            if (!isAdminAuthorized(req)) {
+              return sendJson(res, 403, { error: 'Admin authorization required to switch server cache.' });
+            }
             const body = await readJsonBody(req);
-            const dirPath = String(body.dirPath ?? '').trim();
-            if (!dirPath) {
-              return sendJson(res, 400, { error: 'Directory path is required.' });
+            const rawInput = String(body.dirPath ?? '').trim();
+            if (!rawInput) {
+              return sendJson(res, 400, { error: 'Cache source identifier is required.' });
             }
-            const resolved = path.resolve(dirPath.replace(/^~(?=\/|$)/, os.homedir()));
-            const stat = await fs.stat(resolved).catch(() => null);
-            if (!stat || !stat.isDirectory()) {
-              return sendJson(res, 404, { error: `Directory not found: ${resolved}` });
+            const allowed = await getAllowedCacheDirs();
+            let matched = allowed.find((a) => a.id === rawInput || a.label === rawInput);
+            if (!matched) {
+              const candidateReal = await fs
+                .realpath(path.resolve(rawInput.replace(/^~(?=\/|$)/, os.homedir())))
+                .catch(() => null);
+              if (candidateReal) {
+                matched = allowed.find((a) => a.realPath === candidateReal);
+              }
             }
-            const cache = await OsrsUnifiedCache.open(new NodeFileMapProvider(resolved), resolved);
+            if (!matched) {
+              return sendJson(res, 403, {
+                error: 'Access denied: directory is outside the server cache allowlist.',
+              });
+            }
+            const cache = await OsrsUnifiedCache.open(
+              new NodeFileMapProvider(matched.realPath),
+              matched.label
+            );
             state.cache = cache;
-            state.activePath = resolved;
+            state.activePath = matched.realPath;
+            state.activeLabel = matched.label;
+            state.activeMtimeMs = await getMarkerMtimeMs(matched.realPath);
             state.lastError = null;
             const summary = await cache.getSummary();
-            return sendJson(res, 200, { loaded: true, activePath: resolved, summary });
+            return sendJson(res, 200, { loaded: true, activePath: matched.label, summary });
           }
 
           if (pathname === '/api/cache/download-openrs2' && req.method === 'POST') {
+            if (!isAdminAuthorized(req)) {
+              return sendJson(res, 403, { error: 'Admin authorization required to download server cache.' });
+            }
+            if (!checkRateLimit(clientIp, 'openrs2', 2, 60_000)) {
+              return sendJson(res, 429, { error: 'Rate limit exceeded for OpenRS2 downloads.' });
+            }
             const listRes = await fetch('https://archive.openrs2.org/caches.json');
             if (!listRes.ok) {
               return sendJson(res, 502, { error: `OpenRS2 returned HTTP ${listRes.status}` });
@@ -255,13 +439,23 @@ export function osrsApiPlugin(): Plugin {
                 await fs.writeFile(path.join(targetDir, base), data);
               }
             }
-            const cache = await OsrsUnifiedCache.open(new NodeFileMapProvider(targetDir), targetDir);
+            const realTarget = await fs.realpath(targetDir);
+            const cache = await OsrsUnifiedCache.open(
+              new NodeFileMapProvider(realTarget),
+              DEFAULT_CACHE_LABEL
+            );
             state.cache = cache;
-            state.activePath = targetDir;
-            state.activeMtimeMs = await getMarkerMtimeMs(targetDir);
+            state.activePath = realTarget;
+            state.activeLabel = DEFAULT_CACHE_LABEL;
+            state.activeMtimeMs = await getMarkerMtimeMs(realTarget);
             state.lastError = null;
             const summary = await cache.getSummary();
-            return sendJson(res, 200, { loaded: true, activePath: targetDir, summary, openrs2Id: latest.id });
+            return sendJson(res, 200, {
+              loaded: true,
+              activePath: DEFAULT_CACHE_LABEL,
+              summary,
+              openrs2Id: latest.id,
+            });
           }
 
           if (pathname === '/api/cache/npcs' && req.method === 'GET') {
@@ -402,12 +596,15 @@ export function osrsApiPlugin(): Plugin {
           }
 
           if (pathname.startsWith('/api/preview-image/') && req.method === 'POST') {
+            if (!checkRateLimit(clientIp, 'preview', 120, 60_000)) {
+              return sendJson(res, 429, { error: 'Rate limit exceeded for preview uploads.' });
+            }
             const variant = parsePreviewVariant(pathname.slice('/api/preview-image/'.length));
             if (!variant) {
               return sendJson(res, 400, { error: 'Invalid preview variant.' });
             }
 
-            const contentType = String(req.headers['content-type'] ?? '');
+            const contentType = String(req.headers?.['content-type'] ?? '');
             let token = url.searchParams.get('token')?.trim() ?? '';
             let mime = normalizeImageMime(url.searchParams.get('mime') ?? contentType);
             let bytes: Uint8Array;
@@ -427,6 +624,11 @@ export function osrsApiPlugin(): Plugin {
             }
             if (bytes.length === 0) {
               return sendJson(res, 400, { error: 'Image payload cannot be empty.' });
+            }
+            if (!hasValidImageMagicBytes(bytes, mime)) {
+              return sendJson(res, 400, {
+                error: 'Payload header does not match declared image MIME type.',
+              });
             }
             if (!token || !/^[a-zA-Z0-9_-]{1,64}$/.test(token)) {
               token = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
@@ -481,6 +683,8 @@ export function osrsApiPlugin(): Plugin {
             res.setHeader('Cache-Control', 'public, max-age=3600, immutable');
             res.setHeader('Accept-Ranges', 'bytes');
             res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.setHeader('Content-Security-Policy', "default-src 'none'");
             if (req.method === 'HEAD') {
               res.end();
               return;
@@ -490,6 +694,9 @@ export function osrsApiPlugin(): Plugin {
           }
 
           if (pathname.startsWith('/api/player/lookup/') && req.method === 'GET') {
+            if (!checkRateLimit(clientIp, 'hiscores', 20, 60_000)) {
+              return sendJson(res, 429, { error: 'Rate limit exceeded for Hiscores lookups.' });
+            }
             const rawName = decodeURIComponent(pathname.slice('/api/player/lookup/'.length)).trim();
             if (!rawName || rawName.length > 12) {
               return sendJson(res, 400, { error: 'Enter a valid OSRS username (1-12 characters).' });

@@ -24,7 +24,15 @@ import {
   OSRS_NPC_CHATHEAD_CAMERA,
   OSRS_PLAYER_CHATHEAD_CAMERA,
 } from "../shared/renderer/SoftwareRasterizer";
-import { ServerCacheProxy } from "./ClientCacheProxy";
+import {
+  BrowserCacheSummaryMeta,
+  clearSavedBrowserCache,
+  getAdminToken,
+  getSavedBrowserCacheMeta,
+  restoreSavedBrowserCache,
+  ServerCacheProxy,
+  setAdminToken,
+} from "./ClientCacheProxy";
 import { AnimationControls } from "./components/AnimationControls";
 import { CacheLoaderPanel } from "./components/CacheLoaderPanel";
 import { ChatboxComposer } from "./components/ChatboxComposer";
@@ -32,6 +40,65 @@ import { NpcLookupPanel } from "./components/NpcLookupPanel";
 import { PlayerLookupPanel } from "./components/PlayerLookupPanel";
 
 type SubjectMode = "npc" | "player";
+
+const USER_PREFS_STORAGE_KEY = "osrs_user_prefs_v1";
+
+const DEFAULT_PLAYER_CONFIG: PlayerCompositionConfig = {
+  gender: "male",
+  headKitId: 215,
+  jawKitId: 11,
+  helmItemId: 0,
+  skinHsl: 4550,
+  hairHsl: 6798,
+  extraColors: [],
+};
+
+interface SavedUserPrefs {
+  mode: SubjectMode;
+  playerName: string;
+  playerConfig: PlayerCompositionConfig;
+}
+
+function loadSavedUserPrefs(): SavedUserPrefs {
+  const fallback: SavedUserPrefs = {
+    mode: "npc",
+    playerName: "Seraphim IRL",
+    playerConfig: DEFAULT_PLAYER_CONFIG,
+  };
+  try {
+    if (typeof localStorage === "undefined") return fallback;
+    const raw = localStorage.getItem(USER_PREFS_STORAGE_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<SavedUserPrefs>;
+    const mode: SubjectMode = parsed.mode === "player" ? "player" : "npc";
+    const playerName =
+      typeof parsed.playerName === "string" && parsed.playerName.length <= 12
+        ? parsed.playerName
+        : fallback.playerName;
+    const pc = parsed.playerConfig;
+    const playerConfig: PlayerCompositionConfig =
+      pc &&
+      (pc.gender === "male" || pc.gender === "female") &&
+      typeof pc.headKitId === "number" &&
+      typeof pc.jawKitId === "number" &&
+      typeof pc.helmItemId === "number" &&
+      typeof pc.skinHsl === "number" &&
+      typeof pc.hairHsl === "number"
+        ? {
+            gender: pc.gender,
+            headKitId: pc.headKitId,
+            jawKitId: pc.jawKitId,
+            helmItemId: pc.helmItemId,
+            skinHsl: pc.skinHsl,
+            hairHsl: pc.hairHsl,
+            extraColors: Array.isArray(pc.extraColors) ? pc.extraColors : [],
+          }
+        : DEFAULT_PLAYER_CONFIG;
+    return { mode, playerName, playerConfig };
+  } catch {
+    return fallback;
+  }
+}
 
 interface CacheStatusResponse {
   loaded: boolean;
@@ -42,6 +109,7 @@ interface CacheStatusResponse {
 }
 
 export const App: React.FC = () => {
+  const [initialPrefs] = useState<SavedUserPrefs>(() => loadSavedUserPrefs());
   const [cache, setCache] = useState<UnifiedCache | null>(null);
   const [summary, setSummary] = useState<CacheSummary | null>(null);
   const [activePath, setActivePath] = useState("./cache");
@@ -50,24 +118,23 @@ export const App: React.FC = () => {
   const [cacheStatusMsg, setCacheStatusMsg] = useState(
     "Loading starter OSRS cache…",
   );
+  const [isUsingBrowserCache, setIsUsingBrowserCache] = useState(false);
+  const [savedCacheMeta, setSavedCacheMeta] = useState<BrowserCacheSummaryMeta | null>(() =>
+    getSavedBrowserCacheMeta(),
+  );
+  const [adminToken, setAdminTokenState] = useState<string>(() => getAdminToken());
 
-  const [mode, setMode] = useState<SubjectMode>("npc");
+  const [mode, setMode] = useState<SubjectMode>(initialPrefs.mode);
 
   // NPC State
   const [selectedNpc, setSelectedNpc] = useState<NpcDef | null>(null);
   const [npcOverrides, setNpcOverrides] = useState<ColorOverride[]>([]);
 
   // Player State
-  const [playerName, setPlayerName] = useState("Seraphim IRL");
-  const [playerConfig, setPlayerConfig] = useState<PlayerCompositionConfig>({
-    gender: "male",
-    headKitId: 215,
-    jawKitId: 11,
-    helmItemId: 0,
-    skinHsl: 4550,
-    hairHsl: 6798,
-    extraColors: [],
-  });
+  const [playerName, setPlayerName] = useState(initialPrefs.playerName);
+  const [playerConfig, setPlayerConfig] = useState<PlayerCompositionConfig>(
+    initialPrefs.playerConfig,
+  );
 
   // Resolved Mesh & Animation State
   const [resolved, setResolved] = useState<ResolvedChathead | null>(null);
@@ -107,54 +174,100 @@ export const App: React.FC = () => {
     };
   }, []);
 
-  // Initialize server cache on mount (with in-memory starter fallback if API unavailable)
+  // Persist subject mode and player customization in localStorage
+  useEffect(() => {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(
+          USER_PREFS_STORAGE_KEY,
+          JSON.stringify({ mode, playerName, playerConfig }),
+        );
+      }
+    } catch {
+      // ignore storage failures
+    }
+  }, [mode, playerName, playerConfig]);
+
+  const loadServerDefaultCache = useCallback(async (isCancelled?: () => boolean) => {
+    try {
+      const res = await fetch("/api/cache/status");
+      if (!res.ok) throw new Error("API unavailable");
+      const data = (await res.json()) as CacheStatusResponse;
+      if (isCancelled?.()) return;
+      setActivePath(data.activePath);
+      setCandidateDirs(data.candidateDirs);
+      if (data.loaded && data.summary) {
+        const proxy = new ServerCacheProxy(data.summary);
+        setCache(proxy);
+        setSummary(data.summary);
+        setIsUsingBrowserCache(false);
+        setCacheStatusMsg(`Loaded server cache (${data.activePath})`);
+        return;
+      }
+    } catch {
+      // Fallback to client-side starter cache
+    }
+
+    if (isCancelled?.()) return;
+    const built = buildStarterCache();
+    const mem = await OsrsUnifiedCache.open(
+      new MemoryFileMapProvider(built.dat2Files.entries()),
+      "Built-in Starter Cache",
+    );
+    const memSum = await mem.getSummary();
+    if (!isCancelled?.()) {
+      setCache(mem);
+      setSummary(memSum);
+      setIsUsingBrowserCache(true);
+      setActivePath("Built-in Starter Cache");
+      setCacheStatusMsg("Loaded built-in starter cache in browser memory.");
+    }
+  }, []);
+
+  // Initialize from persisted browser cache if present, otherwise server default cache
   useEffect(() => {
     let cancelled = false;
     const init = async () => {
-      try {
-        const res = await fetch("/api/cache/status");
-        if (!res.ok) throw new Error("API unavailable");
-        const data = (await res.json()) as CacheStatusResponse;
+      if (getSavedBrowserCacheMeta()) {
+        const saved = await restoreSavedBrowserCache();
         if (cancelled) return;
-        setActivePath(data.activePath);
-        setCandidateDirs(data.candidateDirs);
-        if (data.loaded && data.summary) {
-          const proxy = new ServerCacheProxy(data.summary);
-          setCache(proxy);
-          setSummary(data.summary);
-          setCacheStatusMsg(`Loaded server cache from ${data.activePath}`);
+        if (saved) {
+          const savedSummary = await saved.getSummary();
+          if (cancelled) return;
+          setCache(saved);
+          setSummary(savedSummary);
+          setIsUsingBrowserCache(true);
+          setActivePath("Browser Local Cache");
+          setSavedCacheMeta(getSavedBrowserCacheMeta());
+          setCacheStatusMsg(`Restored saved browser cache: ${savedSummary.sourceLabel}`);
+          // Also fetch allowlisted candidate labels so "Use Server Default Cache" stays informed
+          void fetch("/api/cache/status")
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data: CacheStatusResponse | null) => {
+              if (!cancelled && data) setCandidateDirs(data.candidateDirs ?? []);
+            })
+            .catch(() => undefined);
           return;
         }
-      } catch {
-        // Fallback to client-side starter cache
+        setSavedCacheMeta(null);
       }
-
-      if (cancelled) return;
-      const built = buildStarterCache();
-      const mem = await OsrsUnifiedCache.open(
-        new MemoryFileMapProvider(built.dat2Files.entries()),
-        "Built-in Starter Cache",
-      );
-      const memSum = await mem.getSummary();
-      if (!cancelled) {
-        setCache(mem);
-        setSummary(memSum);
-        setCacheStatusMsg("Loaded built-in starter cache in browser memory.");
-      }
+      await loadServerDefaultCache(() => cancelled);
     };
     void init();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadServerDefaultCache]);
 
   const handleLoadServerPath = async (dirPath: string) => {
     setCacheBusy(true);
-    setCacheStatusMsg(`Loading cache from ${dirPath}…`);
+    setCacheStatusMsg(`Loading server cache (${dirPath})…`);
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (adminToken) headers["X-OSRS-Admin-Token"] = adminToken;
       const res = await fetch("/api/cache/load-path", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ dirPath }),
       });
       const json = (await res.json()) as {
@@ -163,15 +276,16 @@ export const App: React.FC = () => {
         error?: string;
       };
       if (!res.ok || !json.summary) {
-        throw new Error(json.error ?? "Failed to load directory path.");
+        throw new Error(json.error ?? "Failed to load server cache.");
       }
       setSelectedNpc(null);
       setNpcOverrides([]);
       setActivePath(json.activePath ?? dirPath);
       setSummary(json.summary);
       setCache(new ServerCacheProxy(json.summary));
+      setIsUsingBrowserCache(false);
       setCacheStatusMsg(
-        `Loaded server cache from ${json.activePath ?? dirPath}`,
+        `Loaded server cache (${json.activePath ?? dirPath})`,
       );
     } catch (err) {
       setCacheStatusMsg(err instanceof Error ? err.message : String(err));
@@ -186,8 +300,11 @@ export const App: React.FC = () => {
       "Downloading latest Old School RuneScape cache from OpenRS2 (may take ~20-60s)…",
     );
     try {
+      const headers: Record<string, string> = {};
+      if (adminToken) headers["X-OSRS-Admin-Token"] = adminToken;
       const res = await fetch("/api/cache/download-openrs2", {
         method: "POST",
+        headers,
       });
       const json = (await res.json()) as {
         summary?: CacheSummary;
@@ -203,6 +320,7 @@ export const App: React.FC = () => {
       setActivePath(json.activePath ?? "./cache");
       setSummary(json.summary);
       setCache(new ServerCacheProxy(json.summary));
+      setIsUsingBrowserCache(false);
       setCacheStatusMsg(
         `Downloaded and loaded OpenRS2 OSRS cache #${json.openrs2Id ?? ""} (rev ${json.summary.revision})`,
       );
@@ -221,7 +339,43 @@ export const App: React.FC = () => {
     setNpcOverrides([]);
     setCache(nextCache);
     setSummary(nextSummary);
-    setCacheStatusMsg(`Loaded browser cache: ${nextSummary.sourceLabel}`);
+    setIsUsingBrowserCache(true);
+    setActivePath("Browser Local Cache");
+    setSavedCacheMeta(getSavedBrowserCacheMeta());
+    setCacheStatusMsg(`Loaded & saved browser cache: ${nextSummary.sourceLabel}`);
+  };
+
+  const handleUseServerCache = async () => {
+    setCacheBusy(true);
+    setSelectedNpc(null);
+    setNpcOverrides([]);
+    try {
+      await loadServerDefaultCache();
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const handleClearSavedCache = async () => {
+    setCacheBusy(true);
+    try {
+      await clearSavedBrowserCache();
+      setSavedCacheMeta(null);
+      if (isUsingBrowserCache) {
+        setSelectedNpc(null);
+        setNpcOverrides([]);
+        await loadServerDefaultCache();
+      } else {
+        setCacheStatusMsg("Cleared saved browser cache.");
+      }
+    } finally {
+      setCacheBusy(false);
+    }
+  };
+
+  const handleChangeAdminToken = (nextToken: string) => {
+    setAdminTokenState(nextToken);
+    setAdminToken(nextToken);
   };
 
   // Load compatible sequences whenever cache changes
@@ -480,9 +634,15 @@ export const App: React.FC = () => {
             candidateDirs={candidateDirs}
             isBusy={cacheBusy}
             statusMessage={cacheStatusMsg}
+            isUsingBrowserCache={isUsingBrowserCache}
+            savedCacheMeta={savedCacheMeta}
+            adminToken={adminToken}
             onLoadServerPath={handleLoadServerPath}
             onDownloadOpenRs2={handleDownloadOpenRs2}
             onLoadBrowserCache={handleLoadBrowserCache}
+            onUseServerCache={handleUseServerCache}
+            onClearSavedCache={handleClearSavedCache}
+            onChangeAdminToken={handleChangeAdminToken}
           />
 
           <section className="card" aria-label="Character Subject Lookup">
