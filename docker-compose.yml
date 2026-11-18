@@ -1,0 +1,13 @@
+services:
+  osrs-chathead-generator:
+    build: .
+    container_name: osrs-chathead-generator
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - NODE_ENV=production
+      - OSRS_ADMIN_TOKEN=${OSRS_ADMIN_TOKEN:-}
+      - OSRS_ALLOW_HOST_CACHES=0
+    volumes:
+      - ./cache:/app/cache

@@ -31,8 +31,12 @@ function createApiMiddlewareInvoker() {
   ) => Promise<void> | void;
 
   let middleware: MiddlewareFn | null = null;
+  let previewMiddleware: MiddlewareFn | null = null;
   const plugin = osrsApiPlugin();
   const configureServer = plugin.configureServer as unknown as (server: {
+    middlewares: { use: (fn: MiddlewareFn) => void };
+  }) => void;
+  const configurePreviewServer = plugin.configurePreviewServer as unknown as (server: {
     middlewares: { use: (fn: MiddlewareFn) => void };
   }) => void;
   configureServer({
@@ -42,7 +46,16 @@ function createApiMiddlewareInvoker() {
       },
     },
   });
+  expect(typeof configurePreviewServer).toBe('function');
+  configurePreviewServer({
+    middlewares: {
+      use: (fn) => {
+        previewMiddleware = fn;
+      },
+    },
+  });
   expect(middleware).not.toBeNull();
+  expect(previewMiddleware).not.toBeNull();
 
   return async (
     method: string,

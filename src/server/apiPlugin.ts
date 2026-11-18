@@ -340,10 +340,11 @@ function serializeModel(m: ModelDef) {
 }
 
 export function osrsApiPlugin(): Plugin {
-  return {
-    name: 'osrs-chathead-api',
-    configureServer(server) {
-      server.middlewares.use(async (req, res, next) => {
+  const apiMiddleware = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    next: () => void
+  ) => {
         if (!req.url || !req.url.startsWith('/api/')) {
           return next();
         }
@@ -715,7 +716,15 @@ export function osrsApiPlugin(): Plugin {
             error: `${msg}${cause}`,
           });
         }
-      });
+  };
+
+  return {
+    name: 'osrs-chathead-api',
+    configureServer(server) {
+      server.middlewares.use(apiMiddleware);
+    },
+    configurePreviewServer(server) {
+      server.middlewares.use(apiMiddleware);
     },
   };
 }
