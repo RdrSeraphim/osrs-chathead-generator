@@ -80,8 +80,6 @@ function decodeType3(def: ModelDef, data: Uint8Array): void {
   const texCoordLen = b1.u16();
 
   let texType0 = 0;
-  let texType1to3 = 0;
-  let texType2 = 0;
   let texRenderTypes: Int8Array | null = null;
   if (numTexFaces > 0) {
     texRenderTypes = new Int8Array(numTexFaces);
@@ -89,38 +87,14 @@ function decodeType3(def: ModelDef, data: Uint8Array): void {
     for (let i = 0; i < numTexFaces; i++) {
       const t = (texRenderTypes[i] = b1.i8());
       if (t === 0) texType0++;
-      if (t >= 1 && t <= 3) texType1to3++;
-      if (t === 2) texType2++;
     }
   }
 
-  let pos = numTexFaces + vertexCount;
-  const faceTypesPos = pos;
-  if (hasFaceTypes === 1) pos += faceCount;
-  const faceCompressionPos = pos;
-  pos += faceCount;
-  const facePrioritiesPos = pos;
-  if (priorityFlag === 255) pos += faceCount;
-  const faceSkinsPos = pos;
-  if (hasFaceSkins === 1) pos += faceCount;
-  const vertexSkinsPos = pos;
-  pos += texCoordLen;
-  const faceAlphasPos = pos;
-  if (hasFaceAlphas === 1) pos += faceCount;
-  const faceIndexPos = pos;
-  pos += faceIndexLen;
-  const faceTexturesPos = pos;
-  if (hasFaceTextures === 1) pos += faceCount * 2;
-  const texCoordsPos = pos;
-  // Wait: in v3 footer, texCoordLen is at offset -6? Let's match exact v3 layout from ModelLoader.js lines 1565-1600!
-  // In ModelLoader.js: var19=xLen, var20=yLen, var21=zLen, var22=faceIndexLen, var23=texCoordLen, var24=vertexSkinsLen!
-  // Let's re-read var24 (b1.u16()) which wasn't read yet above!
-  // Let's adjust cleanly:
+  // Advance directly to vertexSkinsLen after the shared ModelDecoder header fields
   b1.setPos(data.length - 26 + 2 + 2 + 1 * 8 + 2 * 5);
   const vertexSkinsLen = b1.u16();
 
-  // Recompute exact offsets matching ModelLoader.load3
-  pos = numTexFaces + vertexCount;
+  let pos = numTexFaces + vertexCount;
   const offFaceTypes = pos;
   if (hasFaceTypes === 1) pos += faceCount;
   const offFaceCompress = pos;
@@ -258,18 +232,6 @@ function decodeType3(def: ModelDef, data: Uint8Array): void {
       }
     }
   }
-
-  void faceTypesPos;
-  void faceCompressionPos;
-  void facePrioritiesPos;
-  void faceSkinsPos;
-  void vertexSkinsPos;
-  void faceAlphasPos;
-  void faceIndexPos;
-  void faceTexturesPos;
-  void texCoordsPos;
-  void texType1to3;
-  void texType2;
 }
 
 function decodeType2(def: ModelDef, data: Uint8Array): void {
@@ -291,7 +253,7 @@ function decodeType2(def: ModelDef, data: Uint8Array): void {
   const hasAnimaya = b1.u8();
   const xLen = b1.u16();
   const yLen = b1.u16();
-  const zLen = b1.u16();
+  b1.u16(); // zLen
   const faceIndexLen = b1.u16();
   const vertexSkinsLen = b1.u16();
 
@@ -523,7 +485,7 @@ function decodeOriginal(def: ModelDef, data: Uint8Array): void {
   const hasVertexSkins = b1.u8();
   const xLen = b1.u16();
   const yLen = b1.u16();
-  const zLen = b1.u16();
+  b1.u16(); // zLen
   const faceIndexLen = b1.u16();
 
   let pos = 0;

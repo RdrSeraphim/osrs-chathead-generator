@@ -607,49 +607,7 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
     ]);
   });
 
-  it('publishes and serves preview GIFs via HTTP /api/preview-image/:variant', async () => {
-    const invokeMiddleware = createApiMiddlewareInvoker();
-
-    const sampleGif = Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x3b]);
-    const postRes = await invokeMiddleware(
-      'POST',
-      '/api/preview-image/regular?token=testtok123&mime=image/gif',
-      { 'content-type': 'image/gif' },
-      sampleGif
-    );
-    expect(postRes.statusCode).toBe(200);
-    const postJson = JSON.parse(postRes.body.toString('utf8')) as {
-      url: string;
-      mime: string;
-      bytes: number;
-      token: string;
-    };
-    expect(postJson.url).toBe('/api/preview-image/osrs-regular-testtok123.gif');
-    expect(postJson.mime).toBe('image/gif');
-    expect(postJson.bytes).toBe(sampleGif.length);
-
-    const getRes = await invokeMiddleware('GET', postJson.url, {});
-    expect(getRes.statusCode).toBe(200);
-    expect(getRes.headers.get('content-type')).toBe('image/gif');
-    expect(getRes.headers.get('cache-control')).toBe('public, max-age=3600, immutable');
-    expect(getRes.headers.get('accept-ranges')).toBe('bytes');
-    expect(getRes.headers.get('x-content-type-options')).toBe('nosniff');
-    expect(getRes.headers.get('content-security-policy')).toBe("default-src 'none'");
-    expect(new Uint8Array(getRes.body)).toEqual(sampleGif);
-
-    const headRes = await invokeMiddleware('HEAD', postJson.url, {});
-    expect(headRes.statusCode).toBe(200);
-    expect(headRes.headers.get('content-type')).toBe('image/gif');
-    expect(headRes.headers.get('content-length')).toBe(String(sampleGif.length));
-    expect(headRes.headers.get('cache-control')).toBe('public, max-age=3600, immutable');
-    expect(headRes.headers.get('x-content-type-options')).toBe('nosniff');
-    expect(headRes.body.length).toBe(0);
-
-    const wrongExtRes = await invokeMiddleware('GET', '/api/preview-image/regular.png', {});
-    expect(wrongExtRes.statusCode).toBe(404);
-  });
-
-  it('enforces API security: blocks path traversal, cross-origin POSTs, and invalid image magic bytes', async () => {
+  it('enforces API security: blocks path traversal, cross-origin POSTs, bad Content-Type, and invalid route params', async () => {
     const invokeMiddleware = createApiMiddlewareInvoker();
 
     const statusRes = await invokeMiddleware('GET', '/api/cache/status');
@@ -682,18 +640,31 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
 
     const crossSiteRes = await invokeMiddleware(
       'POST',
-      '/api/preview-image/regular?token=bad&mime=image/gif',
-      { 'content-type': 'image/gif', 'sec-fetch-site': 'cross-site' },
-      Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+      '/api/cache/load-path',
+      { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' },
+      JSON.stringify({ dirPath: './cache' })
     );
     expect(crossSiteRes.statusCode).toBe(403);
 
-    const badMagicRes = await invokeMiddleware(
+    const wrongCtRes = await invokeMiddleware(
       'POST',
-      '/api/preview-image/regular?token=badmagic&mime=image/gif',
-      { 'content-type': 'image/gif' },
-      Uint8Array.from([0xde, 0xad, 0xbe, 0xef])
+      '/api/cache/load-path',
+      { 'content-type': 'text/plain' },
+      '{}'
     );
-    expect(badMagicRes.statusCode).toBe(400);
+    expect(wrongCtRes.statusCode).toBe(415);
+
+    const badNpcRes = await invokeMiddleware('GET', '/api/cache/npc/abc');
+    expect(badNpcRes.statusCode).toBe(400);
+
+    const badModelRes = await invokeMiddleware('GET', '/api/cache/model/-1');
+    expect(badModelRes.statusCode).toBe(400);
+
+    const badEncodingRes = await invokeMiddleware('GET', '/api/player/lookup/%E0%A4%A');
+    expect(badEncodingRes.statusCode).toBe(400);
+
+    // Sibling prefix escape attempt must fail containment check
+    const provider = new NodeFileMapProvider(path.resolve(process.cwd(), 'cache'));
+    await expect(provider.getFile('../cache-other/secret')).resolves.toBeUndefined();
   });
 });

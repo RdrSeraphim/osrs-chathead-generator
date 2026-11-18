@@ -1,9 +1,4 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { buildStarterCache } from "../shared/cache/StarterCacheBuilder";
-import {
-  MemoryFileMapProvider,
-  OsrsUnifiedCache,
-} from "../shared/cache/UnifiedCacheLoader";
 import { CacheSummary, NpcDef, UnifiedCache } from "../shared/cache/types";
 import {
   CompatibleSeqEntry,
@@ -47,7 +42,7 @@ const DEFAULT_PLAYER_CONFIG: PlayerCompositionConfig = {
   gender: "male",
   headKitId: 215,
   jawKitId: 11,
-  helmItemId: 0,
+  helmItemId: null,
   skinHsl: 4550,
   hairHsl: 6798,
   extraColors: [],
@@ -62,7 +57,7 @@ interface SavedUserPrefs {
 function loadSavedUserPrefs(): SavedUserPrefs {
   const fallback: SavedUserPrefs = {
     mode: "npc",
-    playerName: "Seraphim IRL",
+    playerName: "Adventurer",
     playerConfig: DEFAULT_PLAYER_CONFIG,
   };
   try {
@@ -80,15 +75,17 @@ function loadSavedUserPrefs(): SavedUserPrefs {
       pc &&
       (pc.gender === "male" || pc.gender === "female") &&
       typeof pc.headKitId === "number" &&
-      typeof pc.jawKitId === "number" &&
-      typeof pc.helmItemId === "number" &&
+      (pc.jawKitId === null || typeof pc.jawKitId === "number") &&
+      (pc.helmItemId === null || typeof pc.helmItemId === "number") &&
       typeof pc.skinHsl === "number" &&
       typeof pc.hairHsl === "number"
         ? {
             gender: pc.gender,
             headKitId: pc.headKitId,
             jawKitId: pc.jawKitId,
-            helmItemId: pc.helmItemId,
+            // Migrate legacy helmItemId: 0 to null so Dwarf remains isn't equipped by default
+            helmItemId:
+              pc.helmItemId !== null && pc.helmItemId > 0 ? pc.helmItemId : null,
             skinHsl: pc.skinHsl,
             hairHsl: pc.hairHsl,
             extraColors: Array.isArray(pc.extraColors) ? pc.extraColors : [],
@@ -209,6 +206,11 @@ export const App: React.FC = () => {
     }
 
     if (isCancelled?.()) return;
+    const [{ buildStarterCache }, { MemoryFileMapProvider, OsrsUnifiedCache }] =
+      await Promise.all([
+        import("../shared/cache/StarterCacheBuilder"),
+        import("../shared/cache/UnifiedCacheLoader"),
+      ]);
     const built = buildStarterCache();
     const mem = await OsrsUnifiedCache.open(
       new MemoryFileMapProvider(built.dat2Files.entries()),

@@ -28,60 +28,6 @@ interface ChatboxComposerProps {
   ) => Promise<Array<{ frame: RasterOutput; delayMs: number }>>;
 }
 
-type PreviewVariant = 'regular' | 'full' | 'chatbox';
-
-interface PublishedPreview {
-  url: string;
-  token: string;
-  mime: 'image/gif' | 'image/png';
-}
-
-function createPreviewToken(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-  }
-  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-async function publishPreviewImage(
-  variant: PreviewVariant,
-  blob: Blob
-): Promise<PublishedPreview> {
-  const mime: 'image/gif' | 'image/png' = blob.type === 'image/gif' ? 'image/gif' : 'image/png';
-  const token = createPreviewToken();
-  try {
-    const res = await fetch(
-      `/api/preview-image/${variant}?token=${encodeURIComponent(token)}&mime=${encodeURIComponent(mime)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': mime },
-        body: blob,
-      }
-    );
-    if (res.ok) {
-      const data = (await res.json()) as {
-        url?: string;
-        token?: string;
-        mime?: 'image/gif' | 'image/png';
-      };
-      if (typeof data.url === 'string' && data.url.length > 0) {
-        return {
-          url: data.url,
-          token: typeof data.token === 'string' ? data.token : token,
-          mime: data.mime === 'image/gif' ? 'image/gif' : mime,
-        };
-      }
-    }
-  } catch {
-    // Fallback to local object URL when backend dev middleware is unavailable
-  }
-  return {
-    url: URL.createObjectURL(blob),
-    token,
-    mime,
-  };
-}
-
 function rasterToDataUrl(raster: RasterOutput): string {
   const canvas = document.createElement('canvas');
   canvas.width = raster.width;
@@ -161,10 +107,10 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
   const [isExporting, setIsExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState('');
 
-  const [regularPreview, setRegularPreview] = useState<PublishedPreview | null>(null);
-  const [fullPreview, setFullPreview] = useState<PublishedPreview | null>(null);
+  const [regularPreviewUrl, setRegularPreviewUrl] = useState<string | null>(null);
+  const [fullPreviewUrl, setFullPreviewUrl] = useState<string | null>(null);
   const [fullGifDims, setFullGifDims] = useState<{ width: number; height: number } | null>(null);
-  const [chatboxPreview, setChatboxPreview] = useState<PublishedPreview | null>(null);
+  const [chatboxPreviewUrl, setChatboxPreviewUrl] = useState<string | null>(null);
   const [regularSeqFrames, setRegularSeqFrames] = useState<Array<{
     frame: RasterOutput;
     delayMs: number;
@@ -191,50 +137,49 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
     setLayout(defaultLayout);
   }, [defaultLayout]);
 
-  // Revoke fallback blob URLs cleanly only after replacement commits
+  // Revoke object URLs cleanly only after replacement commits
   useEffect(() => {
     return () => {
-      if (regularPreview?.url.startsWith('blob:')) URL.revokeObjectURL(regularPreview.url);
+      if (regularPreviewUrl) URL.revokeObjectURL(regularPreviewUrl);
     };
-  }, [regularPreview]);
+  }, [regularPreviewUrl]);
 
   useEffect(() => {
     return () => {
-      if (fullPreview?.url.startsWith('blob:')) URL.revokeObjectURL(fullPreview.url);
+      if (fullPreviewUrl) URL.revokeObjectURL(fullPreviewUrl);
     };
-  }, [fullPreview]);
+  }, [fullPreviewUrl]);
 
   useEffect(() => {
     return () => {
-      if (chatboxPreview?.url.startsWith('blob:')) URL.revokeObjectURL(chatboxPreview.url);
+      if (chatboxPreviewUrl) URL.revokeObjectURL(chatboxPreviewUrl);
     };
-  }, [chatboxPreview]);
+  }, [chatboxPreviewUrl]);
 
-  // Build stable image/gif (playing) or image/png (paused/static) previews served via HTTP .gif/.png URLs
+  // Build stable client-side Blob URLs (image/gif when playing, image/png when paused/static)
   useEffect(() => {
     let cancelled = false;
     regularGifBlobRef.current = null;
     fullGifBlobRef.current = null;
 
     if (!hasRegularHead) {
-      setRegularPreview(null);
-      setFullPreview(null);
+      setRegularPreviewUrl(null);
+      setFullPreviewUrl(null);
       setFullGifDims(null);
       setRegularSeqFrames(null);
       return;
     }
 
-    const commitPublished = async (
-      variant: PreviewVariant,
+    const commitBlob = (
       blob: Blob,
-      setter: React.Dispatch<React.SetStateAction<PublishedPreview | null>>
+      setter: React.Dispatch<React.SetStateAction<string | null>>
     ) => {
-      const published = await publishPreviewImage(variant, blob);
+      const url = URL.createObjectURL(blob);
       if (cancelled) {
-        if (published.url.startsWith('blob:')) URL.revokeObjectURL(published.url);
+        URL.revokeObjectURL(url);
         return;
       }
-      setter(published);
+      setter(url);
     };
 
     const buildHeadPreviews = async () => {
@@ -248,12 +193,12 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
           const regGifBytes = encodeAnimatedGif(regFrames, true);
           const regBlob = new Blob([new Uint8Array(regGifBytes)], { type: 'image/gif' });
           regularGifBlobRef.current = regBlob;
-          await commitPublished('regular', regBlob, setRegularPreview);
+          commitBlob(regBlob, setRegularPreviewUrl);
           if (cancelled) return;
         } else if (latestHeadsRef.current.regularHead) {
           const regBlob = await rasterToPngBlob(latestHeadsRef.current.regularHead);
           if (cancelled) return;
-          await commitPublished('regular', regBlob, setRegularPreview);
+          commitBlob(regBlob, setRegularPreviewUrl);
           if (cancelled) return;
         }
 
@@ -268,16 +213,16 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
             const fullGifBytes = encodeAnimatedGif(fullFrames, true);
             const fullBlob = new Blob([new Uint8Array(fullGifBytes)], { type: 'image/gif' });
             fullGifBlobRef.current = fullBlob;
-            await commitPublished('full', fullBlob, setFullPreview);
+            commitBlob(fullBlob, setFullPreviewUrl);
           } else if (latestHeadsRef.current.fullHead) {
             setFullGifDims(null);
             const fullBlob = await rasterToPngBlob(latestHeadsRef.current.fullHead);
             if (cancelled) return;
-            await commitPublished('full', fullBlob, setFullPreview);
+            commitBlob(fullBlob, setFullPreviewUrl);
           }
         } else {
           setFullGifDims(null);
-          setFullPreview(null);
+          setFullPreviewUrl(null);
         }
         return;
       }
@@ -288,15 +233,15 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
       if (!staticRegularHead) return;
       const regBlob = await rasterToPngBlob(staticRegularHead);
       if (cancelled) return;
-      await commitPublished('regular', regBlob, setRegularPreview);
+      commitBlob(regBlob, setRegularPreviewUrl);
       if (cancelled) return;
 
       if (showFullCard && staticFullHead) {
         const fullBlob = await rasterToPngBlob(staticFullHead);
         if (cancelled) return;
-        await commitPublished('full', fullBlob, setFullPreview);
+        commitBlob(fullBlob, setFullPreviewUrl);
       } else {
-        setFullPreview(null);
+        setFullPreviewUrl(null);
       }
     };
 
@@ -320,7 +265,6 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
     let cancelled = false;
     chatboxGifBlobRef.current = null;
 
-    // Wait for initial/updated sequence frames before building so chatbox doesn't flash/upload a stale PNG
     if (isPlaying && hasSequence && hasRegularHead && regularSeqFrames === null) {
       return;
     }
@@ -349,12 +293,12 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
             const gifBytes = encodeAnimatedGif(boxFrames, false);
             const blob = new Blob([new Uint8Array(gifBytes)], { type: 'image/gif' });
             chatboxGifBlobRef.current = blob;
-            const published = await publishPreviewImage('chatbox', blob);
+            const url = URL.createObjectURL(blob);
             if (cancelled) {
-              if (published.url.startsWith('blob:')) URL.revokeObjectURL(published.url);
+              URL.revokeObjectURL(url);
               return;
             }
-            setChatboxPreview(published);
+            setChatboxPreviewUrl(url);
             return;
           }
 
@@ -368,12 +312,12 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
           });
           const blob = await rasterToPngBlob(box);
           if (cancelled) return;
-          const published = await publishPreviewImage('chatbox', blob);
+          const url = URL.createObjectURL(blob);
           if (cancelled) {
-            if (published.url.startsWith('blob:')) URL.revokeObjectURL(published.url);
+            URL.revokeObjectURL(url);
             return;
           }
-          setChatboxPreview(published);
+          setChatboxPreviewUrl(url);
         };
 
         void buildChatboxPreview();
@@ -549,7 +493,7 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
           )}
         </div>
         <div className="hint" style={{ paddingInline: '0.25rem' }}>
-          Tip: Right-click any preview and choose <strong>Copy Image</strong> (copies animated GIF while playing, or PNG while paused).
+          Tip: Drag any animated GIF directly or use <strong>Download GIF</strong> below (browser Copy Image copies a single PNG frame).
         </div>
 
         <div className="preview-grid">
@@ -562,9 +506,9 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
                 </span>
               )}
             </div>
-            {regularPreview ? (
+            {regularPreviewUrl ? (
               <img
-                src={regularPreview.url}
+                src={regularPreviewUrl}
                 className="pixel-canvas"
                 style={{ maxWidth: 192, maxHeight: 192, width: 'auto', height: 'auto' }}
                 alt="Regular 96x96 slot OSRS chathead preview"
@@ -602,9 +546,9 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
                   {isPlaying && hasSequence ? 'Max Envelope' : 'Tight-Cropped'}
                 </span>
               </div>
-              {fullPreview && (
+              {fullPreviewUrl && (
                 <img
-                  src={fullPreview.url}
+                  src={fullPreviewUrl}
                   className="pixel-canvas"
                   style={{ maxWidth: 220, maxHeight: 300, width: 'auto', height: 'auto' }}
                   alt="Full unclipped OSRS chathead preview"
@@ -635,9 +579,9 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
       </div>
 
       <div className="chatbox-stage">
-        {chatboxPreview && (
+        {chatboxPreviewUrl && (
           <img
-            src={chatboxPreview.url}
+            src={chatboxPreviewUrl}
             className="pixel-canvas"
             width={519}
             height={142}

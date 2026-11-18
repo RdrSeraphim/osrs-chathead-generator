@@ -7,8 +7,9 @@ export class NodeFileMapProvider implements FileMapProvider {
 
   async getFile(name: string): Promise<Uint8Array | undefined> {
     const clean = name.replace(/\\/g, '/').replace(/^\/+/, '');
-    const full = path.resolve(this.rootDir, clean);
-    if (!full.startsWith(path.resolve(this.rootDir))) {
+    const root = path.resolve(this.rootDir);
+    const full = path.resolve(root, clean);
+    if (full !== root && !full.startsWith(root + path.sep)) {
       return undefined;
     }
     try {

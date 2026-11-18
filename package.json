@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build:server": "esbuild src/server/prodServer.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/server.mjs",
+    "build": "tsc --noEmit && vite build && npm run build:server",
     "preview": "vite preview",
+    "start": "node dist/server.mjs",
     "test": "vitest run",
     "fetch-cache": "tsx scripts/fetch-openrs2-cache.ts"
   },

@@ -10,7 +10,7 @@ interface PlayerLookupPanelProps {
   config: PlayerCompositionConfig;
   playerName: string;
   onChangePlayerName: (name: string) => void;
-  onChangeConfig: (next: PlayerCompositionConfig) => void;
+  onChangeConfig: React.Dispatch<React.SetStateAction<PlayerCompositionConfig>>;
 }
 
 interface HiscoresLookupResult {
@@ -46,7 +46,7 @@ export const PlayerLookupPanel: React.FC<PlayerLookupPanelProps> = ({
   const jawKitSelectId = useId();
   const helmSearchId = useId();
 
-  const [rsnInput, setRsnInput] = useState(playerName || 'Zezima');
+  const [rsnInput, setRsnInput] = useState(playerName || 'Adventurer');
   const [lookupStatus, setLookupStatus] = useState<string>('');
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [isLookingUp, setIsLookingUp] = useState(false);
@@ -54,6 +54,10 @@ export const PlayerLookupPanel: React.FC<PlayerLookupPanelProps> = ({
   const [kits, setKits] = useState<KitDef[]>([]);
   const [helmQuery, setHelmQuery] = useState('');
   const [helmResults, setHelmResults] = useState<ItemDef[]>([]);
+
+  useEffect(() => {
+    setRsnInput(playerName || 'Adventurer');
+  }, [playerName]);
 
   useEffect(() => {
     if (!cache) {
@@ -78,21 +82,26 @@ export const PlayerLookupPanel: React.FC<PlayerLookupPanelProps> = ({
   // Ensure selected head/jaw kits remain valid when gender or cache changes
   useEffect(() => {
     if (headKits.length === 0) return;
-    const hasHead = headKits.some((k) => k.id === config.headKitId);
-    const hasJaw = jawKits.some((k) => k.id === config.jawKitId);
-    if (!hasHead || (config.gender === 'male' && !hasJaw && jawKits.length > 0)) {
-      onChangeConfig({
-        ...config,
-        headKitId: hasHead ? config.headKitId : headKits[0]?.id ?? null,
-        jawKitId:
-          config.gender === 'male'
-            ? hasJaw
-              ? config.jawKitId
-              : jawKits[0]?.id ?? null
-            : null,
-      });
-    }
-  }, [headKits, jawKits, config.gender]);
+    onChangeConfig((prev) => {
+      const hasHead = headKits.some((k) => k.id === prev.headKitId);
+      const hasJaw = jawKits.some((k) => k.id === prev.jawKitId);
+      const nextHead = hasHead ? prev.headKitId : headKits[0]?.id ?? null;
+      const nextJaw =
+        prev.gender === 'male'
+          ? hasJaw
+            ? prev.jawKitId
+            : jawKits[0]?.id ?? null
+          : null;
+      if (nextHead === prev.headKitId && nextJaw === prev.jawKitId) {
+        return prev;
+      }
+      return {
+        ...prev,
+        headKitId: nextHead,
+        jawKitId: nextJaw,
+      };
+    });
+  }, [headKits, jawKits, config.gender, onChangeConfig]);
 
   // Search headgear items
   useEffect(() => {

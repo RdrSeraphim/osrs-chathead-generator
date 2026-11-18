@@ -154,6 +154,7 @@ label,
 }
 
 input[type='text'],
+input[type='password'],
 input[type='search'],
 input[type='number'],
 textarea,

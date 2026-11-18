@@ -167,7 +167,6 @@ export class OsrsUnifiedCache implements UnifiedCache {
   private rawKits = new Map<number, Uint8Array>();
   private rawSeqs = new Map<number, Uint8Array>();
   private rawModels = new Map<number, Uint8Array>();
-  private rawFrames = new Map<number, Uint8Array>();
   private rawFramemaps = new Map<number, Uint8Array>();
   private dirArchiveFiles = new Map<string, Map<number, Uint8Array>>();
   private dirArchiveIndex = new Map<number, Set<number>>();

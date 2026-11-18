@@ -1,4 +1,4 @@
-import { ItemDef, KitDef, ModelDef, NpcDef, SeqDef, UnifiedCache } from '../cache/types';
+import { ItemDef, KitDef, NpcDef, SeqDef, UnifiedCache } from '../cache/types';
 import { CHATHEAD_PRESET_MAP } from '../constants/chatheadAnims';
 import {
   DEFAULT_HAIR_SOURCE_HSL,
@@ -51,8 +51,12 @@ export async function resolveNpcChathead(
   let modelIds = activeNpc.chatheadModels.filter((id) => id >= 0 && id !== 65535);
   let usedFallbackModels = false;
 
-  if (modelIds.length === 0 && activeNpc.multiChildren.length > 0) {
-    for (const childId of activeNpc.multiChildren) {
+  if (modelIds.length === 0 && (activeNpc.multiChildren.length > 0 || activeNpc.oobChild >= 0)) {
+    const childIds = [
+      ...activeNpc.multiChildren,
+      ...(activeNpc.oobChild >= 0 ? [activeNpc.oobChild] : []),
+    ];
+    for (const childId of childIds) {
       if (childId < 0) continue;
       const child = await cache.getNpc(childId);
       if (child && child.chatheadModels.length > 0) {

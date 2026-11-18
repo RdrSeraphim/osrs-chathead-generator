@@ -10,8 +10,12 @@ import {
   SeqDef,
   UnifiedCache,
 } from '../shared/cache/types';
-import { MemoryFileMapProvider, normalizeRelPath, OsrsUnifiedCache } from '../shared/cache/UnifiedCacheLoader';
+import type { OsrsUnifiedCache } from '../shared/cache/UnifiedCacheLoader';
 import { CompatibleSeqEntry } from '../shared/renderer/ChatheadPipeline';
+
+function normalizeRelPath(p: string): string {
+  return p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+}
 
 /**
  * Lazy FileMapProvider over a browser FileList (only reads bytes when requested).
@@ -53,8 +57,9 @@ export async function openBrowserCacheFromFiles(
   fileList: FileList | File[],
   label = 'Browser Folder'
 ): Promise<OsrsUnifiedCache> {
+  const { OsrsUnifiedCache: Loader } = await import('../shared/cache/UnifiedCacheLoader');
   const provider = new LazyBrowserFileMapProvider(fileList);
-  return OsrsUnifiedCache.open(provider, label);
+  return Loader.open(provider, label);
 }
 
 const OSRS_ADMIN_TOKEN_KEY = 'osrs_admin_token';
@@ -252,7 +257,10 @@ export async function saveBrowserCacheFiles(
   }
 
   // Validate and open the cache before overwriting any existing persisted browser cache
-  const opened = await OsrsUnifiedCache.open(new MemoryFileMapProvider(entries), label);
+  const { MemoryFileMapProvider, OsrsUnifiedCache: Loader } = await import(
+    '../shared/cache/UnifiedCacheLoader'
+  );
+  const opened = await Loader.open(new MemoryFileMapProvider(entries), label);
   const fileNames = Array.from(entries.keys());
   let storageKind: 'localStorage' | 'indexedDB' = 'indexedDB';
 
@@ -319,7 +327,10 @@ export async function restoreSavedBrowserCache(): Promise<OsrsUnifiedCache | nul
       return null;
     }
 
-    return await OsrsUnifiedCache.open(new MemoryFileMapProvider(entries), meta.label);
+    const { MemoryFileMapProvider, OsrsUnifiedCache: Loader } = await import(
+      '../shared/cache/UnifiedCacheLoader'
+    );
+    return await Loader.open(new MemoryFileMapProvider(entries), meta.label);
   } catch {
     await clearSavedBrowserCache();
     return null;

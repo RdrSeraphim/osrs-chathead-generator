@@ -95,7 +95,9 @@ export const NpcLookupPanel: React.FC<NpcLookupPanelProps> = ({
     onChangeOverrides(colorOverrides.filter((o) => o.from !== fromHsl));
   };
 
-  const validMorphChildren = selectedNpc?.multiChildren.filter((id) => id >= 0) ?? [];
+  const validMorphChildren = Array.from(
+    new Set(selectedNpc?.multiChildren.filter((id) => id >= 0) ?? [])
+  );
 
   return (
     <div className="tabpanel-inner">
@@ -174,6 +176,7 @@ export const NpcLookupPanel: React.FC<NpcLookupPanelProps> = ({
             value={selectedNpc.id}
             onChange={(e) => {
               const nextId = Number(e.target.value);
+              if (nextId === selectedNpc.id) return;
               void cache.getNpc(nextId).then((found) => {
                 if (found) onSelectNpc(found);
               });
@@ -182,6 +185,11 @@ export const NpcLookupPanel: React.FC<NpcLookupPanelProps> = ({
             <button type="button">
               <selectedcontent></selectedcontent>
             </button>
+            {!validMorphChildren.includes(selectedNpc.id) && (
+              <option value={selectedNpc.id}>
+                Base: {selectedNpc.name} (#{selectedNpc.id})
+              </option>
+            )}
             {validMorphChildren.map((cid) => (
               <option key={cid} value={cid}>
                 Variant NPC #{cid}

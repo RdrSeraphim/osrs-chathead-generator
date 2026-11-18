@@ -68,6 +68,7 @@ export function mergeAndLightModels(
   let fOffset = 0;
   let hasAnyAlpha = false;
   let hasAnyPriority = false;
+  let hasAnyTexture = false;
   let defaultPriority = 0;
 
   // Build extra recolor map
@@ -83,6 +84,13 @@ export function mergeAndLightModels(
       const len = Math.min(inp.recolorFrom.length, inp.recolorTo.length);
       for (let i = 0; i < len; i++) {
         localRecolor.set(inp.recolorFrom[i] & 0xffff, inp.recolorTo[i] & 0xffff);
+      }
+    }
+    const localRetexture = new Map<number, number>();
+    if (inp.retextureFrom && inp.retextureTo) {
+      const len = Math.min(inp.retextureFrom.length, inp.retextureTo.length);
+      for (let i = 0; i < len; i++) {
+        localRetexture.set(inp.retextureFrom[i], inp.retextureTo[i]);
       }
     }
 
@@ -150,7 +158,12 @@ export function mergeAndLightModels(
       }
 
       if (m.faceTextures) {
-        faceTextures[idx] = m.faceTextures[f];
+        let texId = m.faceTextures[f];
+        if (texId !== -1 && localRetexture.has(texId)) {
+          texId = localRetexture.get(texId)!;
+        }
+        faceTextures[idx] = texId;
+        if (texId !== -1) hasAnyTexture = true;
       }
     }
 
@@ -322,7 +335,7 @@ export function mergeAndLightModels(
     faceAlphas: hasAnyAlpha ? faceAlphas : null,
     facePriorities: hasAnyPriority ? facePriorities : null,
     defaultPriority,
-    faceTextures: null,
+    faceTextures: hasAnyTexture ? faceTextures : null,
     baseColors,
     vertexGroups,
     faceLabelsAlpha,

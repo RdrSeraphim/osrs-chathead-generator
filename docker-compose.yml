@@ -9,5 +9,11 @@ services:
       - NODE_ENV=production
       - OSRS_ADMIN_TOKEN=${OSRS_ADMIN_TOKEN:-}
       - OSRS_ALLOW_HOST_CACHES=0
+      - TRUST_PROXY=${TRUST_PROXY:-0}
     volumes:
-      - ./cache:/app/cache
+      - osrs-cache:/app/cache
+      # Or bind-mount a host cache directory (ensure UID 1000 can write, e.g.: chown 1000:1000 ./cache):
+      # - ./cache:/app/cache
+
+volumes:
+  osrs-cache:
