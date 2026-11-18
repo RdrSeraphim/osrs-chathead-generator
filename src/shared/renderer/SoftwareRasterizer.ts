@@ -29,10 +29,20 @@ export const OSRS_PLAYER_CHATHEAD_CAMERA: CameraParams = {
   offsetY: 0,
 };
 
+export interface PixelRect {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
 export interface RasterOutput {
   width: number;
   height: number;
   pixels: Uint8ClampedArray;
+  originX?: number;
+  originY?: number;
+  scale?: number;
 }
 
 export function renderChathead(
@@ -41,14 +51,13 @@ export function renderChathead(
   camera: CameraParams,
   baseWidth = 96,
   baseHeight = 96,
-  scale = 2
+  scale = 2,
+  expandToFit = false
 ): RasterOutput {
-  const width = Math.max(1, Math.round(baseWidth * scale));
-  const height = Math.max(1, Math.round(baseHeight * scale));
-  const pixels = new Uint8ClampedArray(width * height * 4);
-
   if (mesh.faceCount === 0 || mesh.vertexCount === 0) {
-    return { width, height, pixels };
+    const width = Math.max(1, Math.round(baseWidth * scale));
+    const height = Math.max(1, Math.round(baseHeight * scale));
+    return { width, height, pixels: new Uint8ClampedArray(width * height * 4) };
   }
 
   const palette =
@@ -70,8 +79,69 @@ export function renderChathead(
 
   const originOffsetX = ((camera.rotationY > 1024 ? 1 : -1) * baseWidth) / 96;
   const originOffsetY = (5 * baseHeight) / 96;
-  const centerX = width / 2 + (originOffsetX + camera.offsetX) * scale;
-  const centerY = height / 2 + (originOffsetY + camera.offsetY) * scale;
+  const stdOriginX = baseWidth / 2 + originOffsetX + camera.offsetX;
+  const stdOriginY = baseHeight / 2 + originOffsetY + camera.offsetY;
+
+  let left = -stdOriginX;
+  let right = baseWidth - stdOriginX;
+  let top = -stdOriginY;
+  let bottom = baseHeight - stdOriginY;
+
+  if (expandToFit) {
+    // Expand bounds using active animated vertices + safety margin before final tight pixel crop
+    let minDx = Infinity;
+    let maxDx = -Infinity;
+    let minDy = Infinity;
+    let maxDy = -Infinity;
+    const avx = animated.verticesX;
+    const avy = animated.verticesY;
+    const avz = animated.verticesZ;
+
+    for (let i = 0; i < mesh.vertexCount; i++) {
+      let x = avx[i];
+      let y = avy[i];
+      let z = avz[i];
+
+      if (roll !== 0) {
+        const nx = (cosZ * x + sinZ * y) >> 16;
+        y = (cosZ * y - sinZ * x) >> 16;
+        x = nx;
+      }
+      if (yaw !== 0) {
+        const nx = (sinY * z + cosY * x) >> 16;
+        z = (cosY * z - sinY * x) >> 16;
+        x = nx;
+      }
+
+      const yCam = (cosX * y - sinX * z) >> 16;
+      const zCam = ((sinX * y + cosX * z) >> 16) + zoom;
+      if (zCam >= 32) {
+        const dx = (x * 512) / zCam;
+        const dy = (yCam * 512) / zCam;
+        if (dx < minDx) minDx = dx;
+        if (dx > maxDx) maxDx = dx;
+        if (dy < minDy) minDy = dy;
+        if (dy > maxDy) maxDy = dy;
+      }
+    }
+
+    if (minDx < maxDx) {
+      const margin = 4;
+      left = Math.min(left, Math.floor(minDx) - margin);
+      right = Math.max(right, Math.ceil(maxDx) + margin);
+      top = Math.min(top, Math.floor(minDy) - margin);
+      bottom = Math.max(bottom, Math.ceil(maxDy) + margin);
+    }
+  }
+
+  const effBaseWidth = Math.max(baseWidth, Math.ceil(right - left));
+  const effBaseHeight = Math.max(baseHeight, Math.ceil(bottom - top));
+  const width = Math.max(1, Math.round(effBaseWidth * scale));
+  const height = Math.max(1, Math.round(effBaseHeight * scale));
+  const pixels = new Uint8ClampedArray(width * height * 4);
+
+  const centerX = -left * scale;
+  const centerY = -top * scale;
   const fov = 512 * scale;
 
   const screenX = new Float64Array(mesh.vertexCount);
@@ -207,7 +277,7 @@ export function renderChathead(
     }
   }
 
-  return { width, height, pixels };
+  return { width, height, pixels, originX: centerX, originY: centerY, scale };
 }
 
 function drawFlatTriangle(
@@ -406,4 +476,63 @@ export function computeAutoFitCamera(
     offsetX: 0,
     offsetY: Math.round((-centerY * 512) / Math.max(1, zoom)),
   };
+}
+
+export function measureOpaqueBounds(raster: RasterOutput): PixelRect | null {
+  let minX = raster.width;
+  let maxX = -1;
+  let minY = raster.height;
+  let maxY = -1;
+
+  for (let y = 0; y < raster.height; y++) {
+    const rowOff = y * raster.width * 4;
+    for (let x = 0; x < raster.width; x++) {
+      if (raster.pixels[rowOff + x * 4 + 3] > 0) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null;
+  return { minX, maxX, minY, maxY };
+}
+
+export function cropRasterToRect(raster: RasterOutput, rect: PixelRect): RasterOutput {
+  const outW = Math.max(1, rect.maxX - rect.minX + 1);
+  const outH = Math.max(1, rect.maxY - rect.minY + 1);
+  const pixels = new Uint8ClampedArray(outW * outH * 4);
+
+  const srcStartX = Math.max(0, rect.minX);
+  const srcEndX = Math.min(raster.width - 1, rect.maxX);
+  const srcStartY = Math.max(0, rect.minY);
+  const srcEndY = Math.min(raster.height - 1, rect.maxY);
+
+  if (srcEndX >= srcStartX && srcEndY >= srcStartY) {
+    const copyBytes = (srcEndX - srcStartX + 1) * 4;
+    const dstStartX = srcStartX - rect.minX;
+    for (let sy = srcStartY; sy <= srcEndY; sy++) {
+      const dy = sy - rect.minY;
+      const srcOff = (sy * raster.width + srcStartX) * 4;
+      const dstOff = (dy * outW + dstStartX) * 4;
+      pixels.set(raster.pixels.subarray(srcOff, srcOff + copyBytes), dstOff);
+    }
+  }
+
+  return {
+    width: outW,
+    height: outH,
+    pixels,
+    originX: raster.originX !== undefined ? raster.originX - rect.minX : undefined,
+    originY: raster.originY !== undefined ? raster.originY - rect.minY : undefined,
+    scale: raster.scale,
+  };
+}
+
+export function cropRasterToOpaqueBounds(raster: RasterOutput): RasterOutput {
+  const bounds = measureOpaqueBounds(raster);
+  if (!bounds) return raster;
+  return cropRasterToRect(raster, bounds);
 }

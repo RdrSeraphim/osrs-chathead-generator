@@ -15,6 +15,9 @@ import {
 import {
   CameraParams,
   computeAutoFitCamera,
+  cropRasterToOpaqueBounds,
+  cropRasterToRect,
+  measureOpaqueBounds,
   OSRS_NPC_CHATHEAD_CAMERA,
   OSRS_PLAYER_CHATHEAD_CAMERA,
   RasterOutput,
@@ -248,6 +251,65 @@ export async function findChatheadSequences(
   return results;
 }
 
+function getFramePairIdsForStep(
+  seq: SeqDef,
+  frameIndex: number
+): { primaryId: number; chatId: number } {
+  if (seq.frameIds.length > 0) {
+    const idx = frameIndex % seq.frameIds.length;
+    return {
+      primaryId: seq.frameIds[idx],
+      chatId: idx < seq.chatFrameIds.length ? seq.chatFrameIds[idx] : -1,
+    };
+  }
+  if (seq.chatFrameIds.length > 0) {
+    const idx = frameIndex % seq.chatFrameIds.length;
+    return {
+      primaryId: -1,
+      chatId: seq.chatFrameIds[idx],
+    };
+  }
+  return { primaryId: -1, chatId: -1 };
+}
+
+async function prefetchSequenceFrames(cache: UnifiedCache, seq: SeqDef): Promise<void> {
+  const count = Math.max(1, seq.frameIds.length, seq.chatFrameIds.length);
+  const frameIds = new Set<number>();
+  for (let i = 0; i < count; i++) {
+    const { primaryId, chatId } = getFramePairIdsForStep(seq, i);
+    if (primaryId >= 0 && (primaryId & 0xffff) !== 0xffff) frameIds.add(primaryId);
+    if (chatId >= 0 && (chatId & 0xffff) !== 0xffff) frameIds.add(chatId);
+  }
+  await Promise.all(
+    Array.from(frameIds, (id) => cache.getFrame(id >>> 16, id & 0xffff))
+  );
+}
+
+async function resolveAnimatedVertices(
+  cache: UnifiedCache,
+  mesh: LitMesh,
+  seq?: SeqDef | null,
+  frameIndex = 0
+) {
+  if (!seq || (seq.frameIds.length === 0 && seq.chatFrameIds.length === 0)) {
+    return animateMesh(mesh);
+  }
+
+  const { primaryId, chatId } = getFramePairIdsForStep(seq, frameIndex);
+
+  let primaryFrame;
+  if (primaryId >= 0 && (primaryId & 0xffff) !== 0xffff) {
+    primaryFrame = await cache.getFrame(primaryId >>> 16, primaryId & 0xffff);
+  }
+
+  let chatFrame;
+  if (chatId >= 0 && (chatId & 0xffff) !== 0xffff) {
+    chatFrame = await cache.getFrame(chatId >>> 16, chatId & 0xffff);
+  }
+
+  return animateMesh(mesh, primaryFrame, chatFrame);
+}
+
 export async function renderAnimatedFrame(
   cache: UnifiedCache,
   mesh: LitMesh,
@@ -255,33 +317,117 @@ export async function renderAnimatedFrame(
   seq?: SeqDef | null,
   frameIndex = 0,
   baseSize = 96,
-  scale = 2
+  scale = 2,
+  fullUncropped = false
 ): Promise<RasterOutput> {
-  if (!seq || (seq.frameIds.length === 0 && seq.chatFrameIds.length === 0)) {
-    const staticVerts = animateMesh(mesh);
-    return renderChathead(mesh, staticVerts, camera, baseSize, baseSize, scale);
+  const animated = await resolveAnimatedVertices(cache, mesh, seq, frameIndex);
+  const raster = renderChathead(
+    mesh,
+    animated,
+    camera,
+    baseSize,
+    baseSize,
+    scale,
+    fullUncropped
+  );
+  return fullUncropped ? cropRasterToOpaqueBounds(raster) : raster;
+}
+
+export interface RelativeBounds {
+  minRelX: number;
+  maxRelX: number;
+  minRelY: number;
+  maxRelY: number;
+}
+
+export interface RenderedChatheadPair {
+  regular: RasterOutput;
+  full: RasterOutput;
+  hasSubstantialDifference: boolean;
+}
+
+export async function computeSequenceUnionBounds(
+  cache: UnifiedCache,
+  mesh: LitMesh,
+  camera: CameraParams,
+  seq: SeqDef,
+  baseSize = 96,
+  scale = 2
+): Promise<RelativeBounds | null> {
+  await prefetchSequenceFrames(cache, seq);
+  const count = Math.max(1, seq.frameIds.length, seq.chatFrameIds.length);
+  const seenPoses = new Set<string>();
+  let minRelX = Infinity;
+  let maxRelX = -Infinity;
+  let minRelY = Infinity;
+  let maxRelY = -Infinity;
+
+  for (let i = 0; i < count; i++) {
+    const { primaryId, chatId } = getFramePairIdsForStep(seq, i);
+    const poseKey = `${primaryId}:${chatId}`;
+    if (seenPoses.has(poseKey)) continue;
+    seenPoses.add(poseKey);
+
+    const animated = await resolveAnimatedVertices(cache, mesh, seq, i);
+    const raw = renderChathead(mesh, animated, camera, baseSize, baseSize, scale, true);
+    const bounds = measureOpaqueBounds(raw);
+    if (!bounds) continue;
+
+    const ox = Math.round(raw.originX ?? 0);
+    const oy = Math.round(raw.originY ?? 0);
+    if (bounds.minX - ox < minRelX) minRelX = bounds.minX - ox;
+    if (bounds.maxX - ox > maxRelX) maxRelX = bounds.maxX - ox;
+    if (bounds.minY - oy < minRelY) minRelY = bounds.minY - oy;
+    if (bounds.maxY - oy > maxRelY) maxRelY = bounds.maxY - oy;
   }
 
-  let primaryFrame;
-  if (seq.frameIds.length > 0) {
-    const idx = frameIndex % seq.frameIds.length;
-    const fid = seq.frameIds[idx];
-    if (fid >= 0 && (fid & 0xffff) !== 0xffff) {
-      primaryFrame = await cache.getFrame(fid >>> 16, fid & 0xffff);
-    }
+  if (maxRelX < minRelX || maxRelY < minRelY) return null;
+  return { minRelX, maxRelX, minRelY, maxRelY };
+}
+
+export async function renderAnimatedFramePair(
+  cache: UnifiedCache,
+  mesh: LitMesh,
+  camera: CameraParams,
+  seq?: SeqDef | null,
+  frameIndex = 0,
+  baseSize = 96,
+  scale = 2,
+  unionBounds?: RelativeBounds | null
+): Promise<RenderedChatheadPair> {
+  const animated = await resolveAnimatedVertices(cache, mesh, seq, frameIndex);
+  const regular = renderChathead(mesh, animated, camera, baseSize, baseSize, scale, false);
+  const rawFull = renderChathead(mesh, animated, camera, baseSize, baseSize, scale, true);
+
+  const ox = Math.round(rawFull.originX ?? 0);
+  const oy = Math.round(rawFull.originY ?? 0);
+  const targetRect = unionBounds
+    ? {
+        minX: ox + unionBounds.minRelX,
+        maxX: ox + unionBounds.maxRelX,
+        minY: oy + unionBounds.minRelY,
+        maxY: oy + unionBounds.maxRelY,
+      }
+    : measureOpaqueBounds(rawFull);
+
+  let hasSubstantialDifference = false;
+  if (targetRect) {
+    const regOriginX = regular.originX ?? regular.width / 2;
+    const regOriginY = regular.originY ?? regular.height / 2;
+    const regLeft = (rawFull.originX ?? regOriginX) - regOriginX;
+    const regTop = (rawFull.originY ?? regOriginY) - regOriginY;
+    const regRight = regLeft + regular.width - 1;
+    const regBottom = regTop + regular.height - 1;
+    const tol = 2 * scale;
+    hasSubstantialDifference =
+      targetRect.minX < regLeft - tol ||
+      targetRect.maxX > regRight + tol ||
+      targetRect.minY < regTop - tol ||
+      targetRect.maxY > regBottom + tol;
   }
 
-  let chatFrame;
-  if (seq.chatFrameIds.length > 0) {
-    const idx = frameIndex % seq.chatFrameIds.length;
-    const cfid = seq.chatFrameIds[idx];
-    if (cfid >= 0 && (cfid & 0xffff) !== 0xffff) {
-      chatFrame = await cache.getFrame(cfid >>> 16, cfid & 0xffff);
-    }
-  }
-
-  const animated = animateMesh(mesh, primaryFrame, chatFrame);
-  return renderChathead(mesh, animated, camera, baseSize, baseSize, scale);
+  const full = targetRect ? cropRasterToRect(rawFull, targetRect) : rawFull;
+  return { regular, full, hasSubstantialDifference };
 }
 
 export async function renderSequenceFrames(
@@ -290,16 +436,52 @@ export async function renderSequenceFrames(
   camera: CameraParams,
   seq: SeqDef,
   baseSize = 96,
-  scale = 2
+  scale = 2,
+  fullUncropped = false
 ): Promise<Array<{ frame: RasterOutput; delayMs: number }>> {
+  await prefetchSequenceFrames(cache, seq);
   const count = Math.max(1, seq.frameIds.length, seq.chatFrameIds.length);
+  const unionBounds = fullUncropped
+    ? await computeSequenceUnionBounds(cache, mesh, camera, seq, baseSize, scale)
+    : null;
+
+  const poseCache = new Map<string, RasterOutput>();
   const out: Array<{ frame: RasterOutput; delayMs: number }> = [];
 
   for (let i = 0; i < count; i++) {
-    const raster = await renderAnimatedFrame(cache, mesh, camera, seq, i, baseSize, scale);
+    const { primaryId, chatId } = getFramePairIdsForStep(seq, i);
+    const poseKey = `${primaryId}:${chatId}`;
+
+    let frame = poseCache.get(poseKey);
+    if (!frame) {
+      const animated = await resolveAnimatedVertices(cache, mesh, seq, i);
+      const raw = renderChathead(
+        mesh,
+        animated,
+        camera,
+        baseSize,
+        baseSize,
+        scale,
+        fullUncropped
+      );
+      if (fullUncropped && unionBounds) {
+        const ox = Math.round(raw.originX ?? 0);
+        const oy = Math.round(raw.originY ?? 0);
+        frame = cropRasterToRect(raw, {
+          minX: ox + unionBounds.minRelX,
+          maxX: ox + unionBounds.maxRelX,
+          minY: oy + unionBounds.minRelY,
+          maxY: oy + unionBounds.maxRelY,
+        });
+      } else {
+        frame = raw;
+      }
+      poseCache.set(poseKey, frame);
+    }
+
     const ticks = seq.frameLengths[i % Math.max(1, seq.frameLengths.length)] ?? 4;
     const delayMs = Math.max(20, ticks * 20);
-    out.push({ frame: raster, delayMs });
+    out.push({ frame, delayMs });
   }
 
   return out;

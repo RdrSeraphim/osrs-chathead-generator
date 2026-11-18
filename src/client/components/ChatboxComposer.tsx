@@ -14,11 +14,72 @@ export interface DialogueTurn {
 }
 
 interface ChatboxComposerProps {
-  currentHead: RasterOutput | null;
+  regularHead: RasterOutput | null;
+  fullHead: RasterOutput | null;
+  hasSubstantialDifference: boolean;
   defaultSpeakerName: string;
   defaultLayout: ChatboxLayout;
   hasSequence: boolean;
-  onRenderSequenceFrames: (scale: number) => Promise<Array<{ frame: RasterOutput; delayMs: number }>>;
+  isPlaying: boolean;
+  renderScale: number;
+  onRenderSequenceFrames: (
+    scale: number,
+    fullUncropped?: boolean
+  ) => Promise<Array<{ frame: RasterOutput; delayMs: number }>>;
+}
+
+type PreviewVariant = 'regular' | 'full' | 'chatbox';
+
+interface PublishedPreview {
+  url: string;
+  token: string;
+  mime: 'image/gif' | 'image/png';
+}
+
+function createPreviewToken(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  }
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function publishPreviewImage(
+  variant: PreviewVariant,
+  blob: Blob
+): Promise<PublishedPreview> {
+  const mime: 'image/gif' | 'image/png' = blob.type === 'image/gif' ? 'image/gif' : 'image/png';
+  const token = createPreviewToken();
+  try {
+    const res = await fetch(
+      `/api/preview-image/${variant}?token=${encodeURIComponent(token)}&mime=${encodeURIComponent(mime)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': mime },
+        body: blob,
+      }
+    );
+    if (res.ok) {
+      const data = (await res.json()) as {
+        url?: string;
+        token?: string;
+        mime?: 'image/gif' | 'image/png';
+      };
+      if (typeof data.url === 'string' && data.url.length > 0) {
+        return {
+          url: data.url,
+          token: typeof data.token === 'string' ? data.token : token,
+          mime: data.mime === 'image/gif' ? 'image/gif' : mime,
+        };
+      }
+    }
+  } catch {
+    // Fallback to local object URL when backend dev middleware is unavailable
+  }
+  return {
+    url: URL.createObjectURL(blob),
+    token,
+    mime,
+  };
 }
 
 function rasterToDataUrl(raster: RasterOutput): string {
@@ -29,6 +90,21 @@ function rasterToDataUrl(raster: RasterOutput): string {
   const img = new ImageData(new Uint8ClampedArray(raster.pixels), raster.width, raster.height);
   ctx.putImageData(img, 0, 0);
   return canvas.toDataURL('image/png');
+}
+
+function rasterToPngBlob(raster: RasterOutput): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = raster.width;
+    canvas.height = raster.height;
+    const ctx = canvas.getContext('2d')!;
+    const img = new ImageData(new Uint8ClampedArray(raster.pixels), raster.width, raster.height);
+    ctx.putImageData(img, 0, 0);
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error('Failed to encode PNG blob.'));
+    }, 'image/png');
+  });
 }
 
 function downloadBlob(blob: Blob, filename: string): void {
@@ -53,10 +129,14 @@ function downloadPngFromRaster(raster: RasterOutput, filename: string): void {
 }
 
 export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
-  currentHead,
+  regularHead,
+  fullHead,
+  hasSubstantialDifference,
   defaultSpeakerName,
   defaultLayout,
   hasSequence,
+  isPlaying,
+  renderScale,
   onRenderSequenceFrames,
 }) => {
   const formHeadingId = useId();
@@ -67,6 +147,7 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
   const layoutLeftId = useId();
   const layoutRightId = useId();
   const layoutNoneId = useId();
+  const fullToggleId = useId();
 
   const [speakerName, setSpeakerName] = useState(defaultSpeakerName);
   const [dialogueText, setDialogueText] = useState(
@@ -75,12 +156,31 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
   const [showPrompt, setShowPrompt] = useState(true);
   const [promptText, setPromptText] = useState('Click here to continue');
   const [layout, setLayout] = useState<ChatboxLayout>(defaultLayout);
+  const [alwaysShowFullPreview, setAlwaysShowFullPreview] = useState(false);
   const [turns, setTurns] = useState<DialogueTurn[]>([]);
   const [isExporting, setIsExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState('');
 
-  const headCanvasRef = useRef<HTMLCanvasElement>(null);
-  const boxCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [regularPreview, setRegularPreview] = useState<PublishedPreview | null>(null);
+  const [fullPreview, setFullPreview] = useState<PublishedPreview | null>(null);
+  const [fullGifDims, setFullGifDims] = useState<{ width: number; height: number } | null>(null);
+  const [chatboxPreview, setChatboxPreview] = useState<PublishedPreview | null>(null);
+  const [regularSeqFrames, setRegularSeqFrames] = useState<Array<{
+    frame: RasterOutput;
+    delayMs: number;
+  }> | null>(null);
+
+  const regularGifBlobRef = useRef<Blob | null>(null);
+  const fullGifBlobRef = useRef<Blob | null>(null);
+  const chatboxGifBlobRef = useRef<Blob | null>(null);
+
+  const hasRegularHead = Boolean(regularHead);
+  const latestHeadsRef = useRef({ regularHead, fullHead });
+  latestHeadsRef.current = { regularHead, fullHead };
+  const staticRegularHead = !isPlaying || !hasSequence ? regularHead : null;
+  const staticFullHead = !isPlaying || !hasSequence ? fullHead : null;
+
+  const showFullCard = Boolean(fullHead && (hasSubstantialDifference || alwaysShowFullPreview));
 
   // Sync speaker name & layout when switching subject unless user typed custom name
   useEffect(() => {
@@ -91,45 +191,224 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
     setLayout(defaultLayout);
   }, [defaultLayout]);
 
-  // Draw standalone chathead preview
+  // Revoke fallback blob URLs cleanly only after replacement commits
   useEffect(() => {
-    const canvas = headCanvasRef.current;
-    if (!canvas || !currentHead) return;
-    canvas.width = currentHead.width;
-    canvas.height = currentHead.height;
-    const ctx = canvas.getContext('2d')!;
-    const img = new ImageData(new Uint8ClampedArray(currentHead.pixels), currentHead.width, currentHead.height);
-    ctx.putImageData(img, 0, 0);
-  }, [currentHead]);
+    return () => {
+      if (regularPreview?.url.startsWith('blob:')) URL.revokeObjectURL(regularPreview.url);
+    };
+  }, [regularPreview]);
 
-  // Draw live 519x142 OSRS chatbox preview
   useEffect(() => {
-    const canvas = boxCanvasRef.current;
-    if (!canvas) return;
-    const box = renderChatbox(currentHead, {
-      speakerName,
-      dialogueText,
-      promptText,
-      showPrompt,
-      layout,
-      scale: 1,
-    });
-    canvas.width = box.width;
-    canvas.height = box.height;
-    const ctx = canvas.getContext('2d')!;
-    const img = new ImageData(new Uint8ClampedArray(box.pixels), box.width, box.height);
-    ctx.putImageData(img, 0, 0);
-  }, [currentHead, speakerName, dialogueText, promptText, showPrompt, layout]);
+    return () => {
+      if (fullPreview?.url.startsWith('blob:')) URL.revokeObjectURL(fullPreview.url);
+    };
+  }, [fullPreview]);
 
-  const handleExportChatheadPng = () => {
-    if (!currentHead) return;
+  useEffect(() => {
+    return () => {
+      if (chatboxPreview?.url.startsWith('blob:')) URL.revokeObjectURL(chatboxPreview.url);
+    };
+  }, [chatboxPreview]);
+
+  // Build stable image/gif (playing) or image/png (paused/static) previews served via HTTP .gif/.png URLs
+  useEffect(() => {
+    let cancelled = false;
+    regularGifBlobRef.current = null;
+    fullGifBlobRef.current = null;
+
+    if (!hasRegularHead) {
+      setRegularPreview(null);
+      setFullPreview(null);
+      setFullGifDims(null);
+      setRegularSeqFrames(null);
+      return;
+    }
+
+    const commitPublished = async (
+      variant: PreviewVariant,
+      blob: Blob,
+      setter: React.Dispatch<React.SetStateAction<PublishedPreview | null>>
+    ) => {
+      const published = await publishPreviewImage(variant, blob);
+      if (cancelled) {
+        if (published.url.startsWith('blob:')) URL.revokeObjectURL(published.url);
+        return;
+      }
+      setter(published);
+    };
+
+    const buildHeadPreviews = async () => {
+      if (isPlaying && hasSequence) {
+        setRegularSeqFrames(null);
+        const regFrames = await onRenderSequenceFrames(renderScale, false);
+        if (cancelled) return;
+
+        setRegularSeqFrames(regFrames);
+        if (regFrames.length > 0) {
+          const regGifBytes = encodeAnimatedGif(regFrames, true);
+          const regBlob = new Blob([new Uint8Array(regGifBytes)], { type: 'image/gif' });
+          regularGifBlobRef.current = regBlob;
+          await commitPublished('regular', regBlob, setRegularPreview);
+          if (cancelled) return;
+        } else if (latestHeadsRef.current.regularHead) {
+          const regBlob = await rasterToPngBlob(latestHeadsRef.current.regularHead);
+          if (cancelled) return;
+          await commitPublished('regular', regBlob, setRegularPreview);
+          if (cancelled) return;
+        }
+
+        if (showFullCard) {
+          const fullFrames = await onRenderSequenceFrames(renderScale, true);
+          if (cancelled) return;
+          if (fullFrames.length > 0) {
+            setFullGifDims({
+              width: fullFrames[0].frame.width,
+              height: fullFrames[0].frame.height,
+            });
+            const fullGifBytes = encodeAnimatedGif(fullFrames, true);
+            const fullBlob = new Blob([new Uint8Array(fullGifBytes)], { type: 'image/gif' });
+            fullGifBlobRef.current = fullBlob;
+            await commitPublished('full', fullBlob, setFullPreview);
+          } else if (latestHeadsRef.current.fullHead) {
+            setFullGifDims(null);
+            const fullBlob = await rasterToPngBlob(latestHeadsRef.current.fullHead);
+            if (cancelled) return;
+            await commitPublished('full', fullBlob, setFullPreview);
+          }
+        } else {
+          setFullGifDims(null);
+          setFullPreview(null);
+        }
+        return;
+      }
+
+      setRegularSeqFrames(null);
+      setFullGifDims(null);
+
+      if (!staticRegularHead) return;
+      const regBlob = await rasterToPngBlob(staticRegularHead);
+      if (cancelled) return;
+      await commitPublished('regular', regBlob, setRegularPreview);
+      if (cancelled) return;
+
+      if (showFullCard && staticFullHead) {
+        const fullBlob = await rasterToPngBlob(staticFullHead);
+        if (cancelled) return;
+        await commitPublished('full', fullBlob, setFullPreview);
+      } else {
+        setFullPreview(null);
+      }
+    };
+
+    void buildHeadPreviews();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    hasRegularHead,
+    staticRegularHead,
+    staticFullHead,
+    showFullCard,
+    isPlaying,
+    hasSequence,
+    renderScale,
+    onRenderSequenceFrames,
+  ]);
+
+  // Build stable 519x142 OSRS chatbox <img> preview (animated GIF while playing, PNG while paused/static)
+  useEffect(() => {
+    let cancelled = false;
+    chatboxGifBlobRef.current = null;
+
+    // Wait for initial/updated sequence frames before building so chatbox doesn't flash/upload a stale PNG
+    if (isPlaying && hasSequence && hasRegularHead && regularSeqFrames === null) {
+      return;
+    }
+
+    const timer = setTimeout(
+      () => {
+        const buildChatboxPreview = async () => {
+          if (isPlaying && hasSequence && regularSeqFrames && regularSeqFrames.length > 0) {
+            const boxPoseCache = new Map<RasterOutput, RasterOutput>();
+            const boxFrames = regularSeqFrames.map((f) => {
+              let cachedBox = boxPoseCache.get(f.frame);
+              if (!cachedBox) {
+                cachedBox = renderChatbox(f.frame, {
+                  speakerName,
+                  dialogueText,
+                  promptText,
+                  showPrompt,
+                  layout,
+                  scale: 1,
+                });
+                boxPoseCache.set(f.frame, cachedBox);
+              }
+              return { frame: cachedBox, delayMs: f.delayMs };
+            });
+
+            const gifBytes = encodeAnimatedGif(boxFrames, false);
+            const blob = new Blob([new Uint8Array(gifBytes)], { type: 'image/gif' });
+            chatboxGifBlobRef.current = blob;
+            const published = await publishPreviewImage('chatbox', blob);
+            if (cancelled) {
+              if (published.url.startsWith('blob:')) URL.revokeObjectURL(published.url);
+              return;
+            }
+            setChatboxPreview(published);
+            return;
+          }
+
+          const box = renderChatbox(latestHeadsRef.current.regularHead, {
+            speakerName,
+            dialogueText,
+            promptText,
+            showPrompt,
+            layout,
+            scale: 1,
+          });
+          const blob = await rasterToPngBlob(box);
+          if (cancelled) return;
+          const published = await publishPreviewImage('chatbox', blob);
+          if (cancelled) {
+            if (published.url.startsWith('blob:')) URL.revokeObjectURL(published.url);
+            return;
+          }
+          setChatboxPreview(published);
+        };
+
+        void buildChatboxPreview();
+      },
+      regularSeqFrames && regularSeqFrames.length > 0 ? 60 : 120
+    );
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    isPlaying,
+    hasSequence,
+    hasRegularHead,
+    staticRegularHead,
+    regularSeqFrames,
+    speakerName,
+    dialogueText,
+    promptText,
+    showPrompt,
+    layout,
+  ]);
+
+  const handleExportChatheadPng = (variant: 'regular' | 'full') => {
+    const target = variant === 'full' ? fullHead : regularHead;
+    if (!target) return;
     const slug = (speakerName || 'chathead').toLowerCase().replace(/[^a-z0-9]+/g, '-');
-    downloadPngFromRaster(currentHead, `${slug}-chathead.png`);
-    setExportStatus(`Exported ${slug}-chathead.png (${currentHead.width}x${currentHead.height})`);
+    const filename = `${slug}-chathead-${variant}.png`;
+    downloadPngFromRaster(target, filename);
+    setExportStatus(`Exported ${filename} (${target.width}×${target.height}px)`);
   };
 
   const handleExportChatboxPng = () => {
-    const box = renderChatbox(currentHead, {
+    const box = renderChatbox(regularHead, {
       speakerName,
       dialogueText,
       promptText,
@@ -142,16 +421,26 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
     setExportStatus(`Exported ${slug}-chatbox.png (1038x284)`);
   };
 
-  const handleExportChatheadGif = async () => {
+  const handleExportChatheadGif = async (variant: 'regular' | 'full') => {
     if (!hasSequence) return;
+    const isFull = variant === 'full';
+    const slug = (speakerName || 'chathead').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    const filename = `${slug}-chathead-${variant}.gif`;
+    const cachedBlob = isFull ? fullGifBlobRef.current : regularGifBlobRef.current;
+    if (cachedBlob) {
+      downloadBlob(cachedBlob, filename);
+      setExportStatus(`Exported ${filename}`);
+      return;
+    }
+
     setIsExporting(true);
-    setExportStatus('Encoding animated transparent chathead GIF…');
+    setExportStatus(`Encoding animated transparent ${variant} chathead GIF…`);
     try {
-      const frames = await onRenderSequenceFrames(2);
+      const frames = await onRenderSequenceFrames(renderScale, isFull);
+      if (frames.length === 0) return;
       const gifBytes = encodeAnimatedGif(frames, true);
-      const slug = (speakerName || 'chathead').toLowerCase().replace(/[^a-z0-9]+/g, '-');
-      downloadBlob(new Blob([new Uint8Array(gifBytes)], { type: 'image/gif' }), `${slug}-chathead.gif`);
-      setExportStatus(`Exported ${slug}-chathead.gif (${frames.length} frames)`);
+      downloadBlob(new Blob([new Uint8Array(gifBytes)], { type: 'image/gif' }), filename);
+      setExportStatus(`Exported ${filename} (${frames.length} frames)`);
     } finally {
       setIsExporting(false);
     }
@@ -159,25 +448,38 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
 
   const handleExportChatboxGif = async () => {
     if (!hasSequence) return;
+    const slug = (speakerName || 'chatbox').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    const filename = `${slug}-chatbox.gif`;
+    if (chatboxGifBlobRef.current) {
+      downloadBlob(chatboxGifBlobRef.current, filename);
+      setExportStatus(`Exported ${filename}`);
+      return;
+    }
+
     setIsExporting(true);
     setExportStatus('Encoding animated OSRS chatbox GIF…');
     try {
-      const headFrames = await onRenderSequenceFrames(1);
-      const boxFrames = headFrames.map((f) => ({
-        frame: renderChatbox(f.frame, {
-          speakerName,
-          dialogueText,
-          promptText,
-          showPrompt,
-          layout,
-          scale: 1,
-        }),
-        delayMs: f.delayMs,
-      }));
+      const headFrames = await onRenderSequenceFrames(1, false);
+      if (headFrames.length === 0) return;
+      const boxPoseCache = new Map<RasterOutput, RasterOutput>();
+      const boxFrames = headFrames.map((f) => {
+        let cachedBox = boxPoseCache.get(f.frame);
+        if (!cachedBox) {
+          cachedBox = renderChatbox(f.frame, {
+            speakerName,
+            dialogueText,
+            promptText,
+            showPrompt,
+            layout,
+            scale: 1,
+          });
+          boxPoseCache.set(f.frame, cachedBox);
+        }
+        return { frame: cachedBox, delayMs: f.delayMs };
+      });
       const gifBytes = encodeAnimatedGif(boxFrames, false);
-      const slug = (speakerName || 'chatbox').toLowerCase().replace(/[^a-z0-9]+/g, '-');
-      downloadBlob(new Blob([new Uint8Array(gifBytes)], { type: 'image/gif' }), `${slug}-chatbox.gif`);
-      setExportStatus(`Exported ${slug}-chatbox.gif (${boxFrames.length} frames)`);
+      downloadBlob(new Blob([new Uint8Array(gifBytes)], { type: 'image/gif' }), filename);
+      setExportStatus(`Exported ${filename} (${boxFrames.length} frames)`);
     } finally {
       setIsExporting(false);
     }
@@ -185,11 +487,14 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
 
   const handleAddTurn = (e: React.FormEvent) => {
     e.preventDefault();
-    const snapshot = currentHead
+    const snapshot: RasterOutput | null = regularHead
       ? {
-          width: currentHead.width,
-          height: currentHead.height,
-          pixels: new Uint8ClampedArray(currentHead.pixels),
+          width: regularHead.width,
+          height: regularHead.height,
+          pixels: new Uint8ClampedArray(regularHead.pixels),
+          originX: regularHead.originX,
+          originY: regularHead.originY,
+          scale: regularHead.scale,
         }
       : null;
 
@@ -229,40 +534,117 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
       <h2 id={formHeadingId}>Live Chathead &amp; OSRS Chatbox Preview</h2>
 
       <div className="preview-stage">
-        <div>
-          <canvas
-            ref={headCanvasRef}
-            className="pixel-canvas"
-            style={{ width: 160, height: 160 }}
-            aria-label="Rendered OSRS chathead preview"
-          />
+        <div className="preview-stage-header">
+          <div className="check-option">
+            <input
+              id={fullToggleId}
+              type="checkbox"
+              checked={alwaysShowFullPreview}
+              onChange={(e) => setAlwaysShowFullPreview(e.target.checked)}
+            />
+            <label htmlFor={fullToggleId}>Always show tight-cropped / full preview</label>
+          </div>
+          {hasSubstantialDifference && (
+            <span className="preview-badge">Model exceeds standard 96×96 slot</span>
+          )}
         </div>
-        <div className="btn-row" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
-          <button
-            type="button"
-            className="primary"
-            disabled={!currentHead || isExporting}
-            onClick={handleExportChatheadPng}
-          >
-            Download Chathead PNG
-          </button>
-          <button
-            type="button"
-            disabled={!currentHead || !hasSequence || isExporting}
-            onClick={() => void handleExportChatheadGif()}
-          >
-            Download Animated Chathead GIF
-          </button>
+        <div className="hint" style={{ paddingInline: '0.25rem' }}>
+          Tip: Right-click any preview and choose <strong>Copy Image</strong> (copies animated GIF while playing, or PNG while paused).
+        </div>
+
+        <div className="preview-grid">
+          <div className="preview-card">
+            <div className="preview-card-title">
+              <span>Regular (96×96 Slot)</span>
+              {regularHead && (
+                <span className="hint">
+                  {regularHead.width}×{regularHead.height}px
+                </span>
+              )}
+            </div>
+            {regularPreview ? (
+              <img
+                src={regularPreview.url}
+                className="pixel-canvas"
+                style={{ maxWidth: 192, maxHeight: 192, width: 'auto', height: 'auto' }}
+                alt="Regular 96x96 slot OSRS chathead preview"
+              />
+            ) : (
+              <div className="hint" style={{ paddingBlock: '2rem' }}>
+                Select an NPC or Player to preview chathead
+              </div>
+            )}
+            <div className="btn-row" style={{ width: '100%', flexDirection: 'column', alignItems: 'stretch' }}>
+              <button
+                type="button"
+                className="primary compact"
+                disabled={!regularHead || isExporting}
+                onClick={() => handleExportChatheadPng('regular')}
+              >
+                Download Regular PNG{regularHead ? ` (${regularHead.width}×${regularHead.height}px)` : ''}
+              </button>
+              <button
+                type="button"
+                className="compact"
+                disabled={!regularHead || !hasSequence || isExporting}
+                onClick={() => void handleExportChatheadGif('regular')}
+              >
+                Download Regular GIF
+              </button>
+            </div>
+          </div>
+
+          {showFullCard && fullHead && (
+            <div className="preview-card">
+              <div className="preview-card-title">
+                <span>Full Chathead (Unclipped)</span>
+                <span className="preview-badge">
+                  {isPlaying && hasSequence ? 'Max Envelope' : 'Tight-Cropped'}
+                </span>
+              </div>
+              {fullPreview && (
+                <img
+                  src={fullPreview.url}
+                  className="pixel-canvas"
+                  style={{ maxWidth: 220, maxHeight: 300, width: 'auto', height: 'auto' }}
+                  alt="Full unclipped OSRS chathead preview"
+                />
+              )}
+              <div className="btn-row" style={{ width: '100%', flexDirection: 'column', alignItems: 'stretch' }}>
+                <button
+                  type="button"
+                  className="primary compact"
+                  disabled={isExporting}
+                  onClick={() => handleExportChatheadPng('full')}
+                >
+                  Download Full PNG ({fullHead.width}×{fullHead.height}px)
+                </button>
+                <button
+                  type="button"
+                  className="compact"
+                  disabled={!hasSequence || isExporting}
+                  onClick={() => void handleExportChatheadGif('full')}
+                >
+                  Download Full GIF
+                  {fullGifDims ? ` (${fullGifDims.width}×${fullGifDims.height}px)` : ''}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
       <div className="chatbox-stage">
-        <canvas
-          ref={boxCanvasRef}
-          className="pixel-canvas"
-          style={{ width: 519, height: 142 }}
-          aria-label="Rendered OSRS dialogue chatbox preview"
-        />
+        {chatboxPreview && (
+          <img
+            src={chatboxPreview.url}
+            className="pixel-canvas"
+            width={519}
+            height={142}
+            style={{ width: 519, height: 142 }}
+            alt="Rendered OSRS dialogue chatbox preview"
+          />
+        )}
       </div>
 
       <div className="btn-row" style={{ marginBottom: '1rem' }}>

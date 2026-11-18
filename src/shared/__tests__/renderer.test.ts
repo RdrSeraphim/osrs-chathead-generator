@@ -1,40 +1,51 @@
 import { describe, expect, it } from 'vitest';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import * as path from 'node:path';
+import { Readable } from 'node:stream';
 import { buildStarterCache } from '../cache/StarterCacheBuilder';
 import { MemoryFileMapProvider, OsrsUnifiedCache } from '../cache/UnifiedCacheLoader';
 import {
+  computeSequenceUnionBounds,
   renderAnimatedFrame,
+  renderAnimatedFramePair,
   renderSequenceFrames,
   resolveNpcChathead,
   resolvePlayerChathead,
 } from '../renderer/ChatheadPipeline';
 import { CHATBOX_HEIGHT, CHATBOX_WIDTH, renderChatbox, stackChatboxes } from '../renderer/ChatboxRenderer';
 import { encodeAnimatedGif } from '../renderer/GifExporter';
-import { OSRS_NPC_CHATHEAD_CAMERA, OSRS_PLAYER_CHATHEAD_CAMERA } from '../renderer/SoftwareRasterizer';
+import {
+  measureOpaqueBounds,
+  OSRS_NPC_CHATHEAD_CAMERA,
+  OSRS_PLAYER_CHATHEAD_CAMERA,
+} from '../renderer/SoftwareRasterizer';
 import { NodeFileMapProvider } from '../../server/NodeFileProvider';
 import { osrsApiPlugin } from '../../server/apiPlugin';
 import { FONT_QUILL_8, measureBitmapText, wrapBitmapText } from '../constants/bitmapFonts';
 
-function countOpaquePixels(pixels: Uint8ClampedArray): {
+function countOpaquePixels(raster: {
+  pixels: Uint8ClampedArray;
+  width: number;
+  height: number;
+}): {
   total: number;
   leftHalf: number;
   rightHalf: number;
   width: number;
 } {
-  const side = Math.round(Math.sqrt(pixels.length / 4));
   let total = 0;
   let leftHalf = 0;
   let rightHalf = 0;
-  for (let y = 0; y < side; y++) {
-    for (let x = 0; x < side; x++) {
-      if (pixels[(y * side + x) * 4 + 3] > 0) {
+  for (let y = 0; y < raster.height; y++) {
+    for (let x = 0; x < raster.width; x++) {
+      if (raster.pixels[(y * raster.width + x) * 4 + 3] > 0) {
         total++;
-        if (x < side / 2) leftHalf++;
+        if (x < raster.width / 2) leftHalf++;
         else rightHalf++;
       }
     }
   }
-  return { total, leftHalf, rightHalf, width: side };
+  return { total, leftHalf, rightHalf, width: raster.width };
 }
 
 function pixelBuffersDiffer(a: Uint8ClampedArray, b: Uint8ClampedArray): boolean {
@@ -147,9 +158,9 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
       null,
       0
     );
-    expect(npcRaster.width).toBe(192);
-    expect(npcRaster.height).toBe(192);
-    const npcStats = countOpaquePixels(npcRaster.pixels);
+    expect(npcRaster.width).toBeGreaterThanOrEqual(192);
+    expect(npcRaster.height).toBeGreaterThanOrEqual(192);
+    const npcStats = countOpaquePixels(npcRaster);
     expect(npcStats.total).toBeGreaterThan(500);
 
     // Player chathead faces left (yaw = 166)
@@ -172,9 +183,9 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
       null,
       0
     );
-    expect(playerRaster.width).toBe(192);
-    expect(playerRaster.height).toBe(192);
-    const playerStats = countOpaquePixels(playerRaster.pixels);
+    expect(playerRaster.width).toBeGreaterThanOrEqual(192);
+    expect(playerRaster.height).toBeGreaterThanOrEqual(192);
+    const playerStats = countOpaquePixels(playerRaster);
     expect(playerStats.total).toBeGreaterThan(500);
 
     // Render same player mesh with NPC right-facing camera to verify yaw actually rotates left vs right
@@ -406,10 +417,15 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
     expect(zeke).toBeDefined();
     const zekeResolved = await resolveNpcChathead(diskCache, zeke!);
     const seq614 = await diskCache.getSeq(614);
-    const zekeHead = await renderAnimatedFrame(diskCache, zekeResolved!.mesh, zekeResolved!.defaultCamera, seq614, 6);
-    expect(zekeHead.width).toBe(192);
-    expect(zekeHead.height).toBe(192);
-    const zekeBox = renderChatbox(zekeHead, {
+    const zekePair = await renderAnimatedFramePair(diskCache, zekeResolved!.mesh, zekeResolved!.defaultCamera, seq614, 6);
+    expect(zekePair.regular.width).toBe(192);
+    expect(zekePair.regular.height).toBe(192);
+    expect(zekePair.hasSubstantialDifference).toBe(true);
+    expect(zekePair.full.height).toBeGreaterThan(250);
+    const zekeFullBounds = measureOpaqueBounds(zekePair.full);
+    expect(zekeFullBounds?.minY).toBe(0);
+    expect(zekeFullBounds?.maxY).toBe(zekePair.full.height - 1);
+    const zekeBox = renderChatbox(zekePair.regular, {
       speakerName: '',
       dialogueText: '',
       layout: 'npc-left',
@@ -418,19 +434,20 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
     });
     expect(measureHeadBoundsInChatbox(zekeBox.pixels)).toEqual({
       minX: 35,
-      maxX: 104,
-      minY: 22,
-      maxY: 117,
+      maxX: 103,
+      minY: 23,
+      maxY: 118,
     });
 
     const farid = await diskCache.getNpc(3115);
     expect(farid).toBeDefined();
     const faridResolved = await resolveNpcChathead(diskCache, farid!);
     const seq610 = await diskCache.getSeq(610);
-    const faridHead = await renderAnimatedFrame(diskCache, faridResolved!.mesh, faridResolved!.defaultCamera, seq610, 4);
-    expect(faridHead.width).toBe(192);
-    expect(faridHead.height).toBe(192);
-    const faridBox = renderChatbox(faridHead, {
+    const faridPair = await renderAnimatedFramePair(diskCache, faridResolved!.mesh, faridResolved!.defaultCamera, seq610, 4);
+    expect(faridPair.regular.width).toBe(192);
+    expect(faridPair.regular.height).toBe(192);
+    expect(faridPair.hasSubstantialDifference).toBe(false);
+    const faridBox = renderChatbox(faridPair.regular, {
       speakerName: '',
       dialogueText: '',
       layout: 'npc-left',
@@ -440,9 +457,60 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
     expect(measureHeadBoundsInChatbox(faridBox.pixels)).toEqual({
       minX: 45,
       maxX: 94,
-      minY: 31,
-      maxY: 109,
+      minY: 32,
+      maxY: 110,
     });
+
+    // Odd Old Man (#16895): full render crops tightly to exact bottom of beard (0 excess rows), regular is 192x192, chatbox stays 23..118
+    const oddOldMan = await diskCache.getNpc(16895);
+    expect(oddOldMan).toBeDefined();
+    const oddResolved = await resolveNpcChathead(diskCache, oddOldMan!);
+    const seq588 = await diskCache.getSeq(588);
+    const oddPair = await renderAnimatedFramePair(diskCache, oddResolved!.mesh, oddResolved!.defaultCamera, seq588, 0);
+    expect(oddPair.regular.width).toBe(192);
+    expect(oddPair.regular.height).toBe(192);
+    expect(oddPair.hasSubstantialDifference).toBe(true);
+    expect(oddPair.full.height).toBeGreaterThan(500);
+    const oddFullBounds = measureOpaqueBounds(oddPair.full);
+    expect(oddFullBounds?.minX).toBe(0);
+    expect(oddFullBounds?.maxX).toBe(oddPair.full.width - 1);
+    expect(oddFullBounds?.minY).toBe(0);
+    expect(oddFullBounds?.maxY).toBe(oddPair.full.height - 1);
+    const oddBox = renderChatbox(oddPair.regular, {
+      speakerName: '',
+      dialogueText: '',
+      layout: 'npc-left',
+      showPrompt: false,
+      scale: 1,
+    });
+    const oddBoxBounds = measureHeadBoundsInChatbox(oddBox.pixels);
+    expect(oddBoxBounds.minY).toBeGreaterThanOrEqual(23);
+    expect(oddBoxBounds.maxY).toBeLessThanOrEqual(118);
+
+    // Animated full-sequence crop & envelope clamping keeps identical upper-limit dimensions across frames
+    const unionBounds = await computeSequenceUnionBounds(diskCache, oddResolved!.mesh, oddResolved!.defaultCamera, seq588!, 96, 2);
+    expect(unionBounds).not.toBeNull();
+    const lockedF0 = await renderAnimatedFramePair(diskCache, oddResolved!.mesh, oddResolved!.defaultCamera, seq588, 0, 96, 2, unionBounds);
+    const lockedF4 = await renderAnimatedFramePair(diskCache, oddResolved!.mesh, oddResolved!.defaultCamera, seq588, 4, 96, 2, unionBounds);
+    const lockedF8 = await renderAnimatedFramePair(diskCache, oddResolved!.mesh, oddResolved!.defaultCamera, seq588, 8, 96, 2, unionBounds);
+    expect(lockedF0.full.width).toBe(lockedF4.full.width);
+    expect(lockedF0.full.height).toBe(lockedF4.full.height);
+    expect(lockedF0.full.width).toBe(lockedF8.full.width);
+    expect(lockedF0.full.height).toBe(lockedF8.full.height);
+
+    // Individual frozen frames crop tightly to that frame's exact opaque pixels (no union enlargement)
+    const tightF8 = await renderAnimatedFramePair(diskCache, oddResolved!.mesh, oddResolved!.defaultCamera, seq588, 8, 96, 2, null);
+    const tightF8Bounds = measureOpaqueBounds(tightF8.full);
+    expect(tightF8Bounds?.minY).toBe(0);
+    expect(tightF8Bounds?.maxY).toBe(tightF8.full.height - 1);
+    expect(tightF8.full.height).toBeLessThanOrEqual(lockedF0.full.height);
+
+    const oddFullSeq = await renderSequenceFrames(diskCache, oddResolved!.mesh, oddResolved!.defaultCamera, seq588!, 96, 2, true);
+    const seqW = oddFullSeq[0].frame.width;
+    const seqH = oddFullSeq[0].frame.height;
+    expect(seqW).toBe(lockedF0.full.width);
+    expect(seqH).toBe(lockedF0.full.height);
+    expect(oddFullSeq.every((f) => f.frame.width === seqW && f.frame.height === seqH)).toBe(true);
   });
 
   it('uses authentic OSRS q8_full metrics for dialogue measurement and wrapping', () => {
@@ -459,5 +527,99 @@ describe('OSRS Cache Loading & Chathead Rendering Engine', () => {
       "manner. I'll have you know I'm an accomplished",
       'merchant.',
     ]);
+  });
+
+  it('publishes and serves preview GIFs via HTTP /api/preview-image/:variant', async () => {
+    type MiddlewareFn = (
+      req: IncomingMessage,
+      res: ServerResponse,
+      next: (err?: unknown) => void
+    ) => Promise<void> | void;
+
+    let middleware: MiddlewareFn | null = null;
+    const plugin = osrsApiPlugin();
+    const configureServer = plugin.configureServer as unknown as (server: {
+      middlewares: { use: (fn: MiddlewareFn) => void };
+    }) => void;
+    configureServer({
+      middlewares: {
+        use: (fn) => {
+          middleware = fn;
+        },
+      },
+    });
+    expect(middleware).not.toBeNull();
+
+    const invokeMiddleware = async (
+      method: string,
+      reqUrl: string,
+      headers: Record<string, string>,
+      body?: Uint8Array
+    ) => {
+      const stream = Readable.from(body ? [Buffer.from(body)] : []);
+      const req = Object.assign(stream, {
+        method,
+        url: reqUrl,
+        headers,
+      }) as unknown as IncomingMessage;
+
+      const resHeaders = new Map<string, string>();
+      let endedBody: Uint8Array = new Uint8Array(0);
+      const res = {
+        statusCode: 200,
+        setHeader: (k: string, v: string) => {
+          resHeaders.set(k.toLowerCase(), String(v));
+        },
+        end: (chunk?: Buffer | Uint8Array | string) => {
+          if (chunk !== undefined) {
+            endedBody =
+              typeof chunk === 'string'
+                ? new TextEncoder().encode(chunk)
+                : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+          }
+        },
+      } as unknown as ServerResponse;
+
+      await middleware!(req, res, () => {
+        throw new Error(`Unexpected next() for ${reqUrl}`);
+      });
+
+      return { statusCode: res.statusCode, headers: resHeaders, body: Buffer.from(endedBody) };
+    };
+
+    const sampleGif = Uint8Array.from([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x3b]);
+    const postRes = await invokeMiddleware(
+      'POST',
+      '/api/preview-image/regular?token=testtok123&mime=image/gif',
+      { 'content-type': 'image/gif' },
+      sampleGif
+    );
+    expect(postRes.statusCode).toBe(200);
+    const postJson = JSON.parse(postRes.body.toString('utf8')) as {
+      url: string;
+      mime: string;
+      bytes: number;
+      token: string;
+    };
+    expect(postJson.url).toBe('/api/preview-image/osrs-regular-testtok123.gif');
+    expect(postJson.mime).toBe('image/gif');
+    expect(postJson.bytes).toBe(sampleGif.length);
+
+    const getRes = await invokeMiddleware('GET', postJson.url, {});
+    expect(getRes.statusCode).toBe(200);
+    expect(getRes.headers.get('content-type')).toBe('image/gif');
+    expect(getRes.headers.get('cache-control')).toBe('public, max-age=3600, immutable');
+    expect(getRes.headers.get('accept-ranges')).toBe('bytes');
+    expect(new Uint8Array(getRes.body)).toEqual(sampleGif);
+
+    const headRes = await invokeMiddleware('HEAD', postJson.url, {});
+    expect(headRes.statusCode).toBe(200);
+    expect(headRes.headers.get('content-type')).toBe('image/gif');
+    expect(headRes.headers.get('content-length')).toBe(String(sampleGif.length));
+    expect(headRes.headers.get('cache-control')).toBe('public, max-age=3600, immutable');
+    expect(headRes.body.length).toBe(0);
+
+    const wrongExtRes = await invokeMiddleware('GET', '/api/preview-image/regular.png', {});
+    expect(wrongExtRes.statusCode).toBe(404);
   });
 });

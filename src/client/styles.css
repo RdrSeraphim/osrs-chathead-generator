@@ -93,7 +93,7 @@ body {
 
 .studio-grid {
   display: grid;
-  grid-template-columns: minmax(340px, 440px) minmax(0, 1fr);
+  grid-template-columns: minmax(340px, 460px) minmax(0, 1fr);
   gap: 1.25rem;
   align-items: start;
 }
@@ -108,6 +108,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1.25rem;
+  min-width: 0;
 }
 
 .card {
@@ -115,6 +116,7 @@ body {
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 1.125rem;
+  min-width: 0;
 }
 
 .card h2 {
@@ -337,14 +339,17 @@ legend {
 }
 
 .tablist [role='tab'] {
-  flex: none;
+  flex: 1 1 0;
+  min-width: 0;
   position: relative;
   border: 0;
   background: transparent;
   color: var(--text-muted);
   border-radius: 6px 6px 0 0;
-  padding: 0.75rem 1.125rem;
+  padding: 0.625rem 0.5rem;
   min-height: 48px;
+  font-size: 0.9375rem;
+  text-align: center;
 }
 
 .tablist [role='tab'][aria-selected='true'] {
@@ -451,16 +456,65 @@ legend {
 /* Stage / Canvas Previews */
 .preview-stage {
   display: flex;
-  flex-wrap: wrap;
-  gap: 1.5rem;
-  align-items: center;
-  justify-content: center;
-  padding: 1.25rem;
+  flex-direction: column;
+  gap: 0.875rem;
+  padding: 1rem;
   border-radius: 8px;
   background:
     repeating-conic-gradient(#24201a 0% 25%, #1c1914 0% 50%) 50% / 20px 20px;
   border: 1px solid var(--border);
   margin-block-end: 1rem;
+}
+
+.preview-stage-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  padding: 0.25rem 0.5rem;
+  background: rgb(23 20 16 / 0.85);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  align-items: start;
+}
+
+.preview-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.875rem;
+  background: rgb(23 20 16 / 0.72);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.preview-card-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.preview-badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: #3a3020;
+  color: var(--accent);
+  border: 1px solid var(--accent-dark);
 }
 
 .pixel-canvas {

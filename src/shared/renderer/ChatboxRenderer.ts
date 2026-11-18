@@ -3,10 +3,15 @@ import {
   FONT_QUILL_8,
   wrapBitmapText,
 } from '../constants/bitmapFonts';
+import {
+  AUTHENTIC_CHATBOX_HEIGHT,
+  AUTHENTIC_CHATBOX_WIDTH,
+  decodeAuthenticChatboxBackdrop,
+} from '../constants/chatboxBackdrop';
 import { RasterOutput } from './SoftwareRasterizer';
 
-export const CHATBOX_WIDTH = 519;
-export const CHATBOX_HEIGHT = 142;
+export const CHATBOX_WIDTH = AUTHENTIC_CHATBOX_WIDTH;
+export const CHATBOX_HEIGHT = AUTHENTIC_CHATBOX_HEIGHT;
 
 export type ChatboxLayout = 'npc-left' | 'player-right' | 'none';
 
@@ -22,80 +27,13 @@ export interface ChatboxOptions {
   promptColor?: number;
 }
 
-// Precomputed deterministic 519x142 authentic OSRS parchment + stone border backdrop
 let cachedBackdrop: Uint8ClampedArray | null = null;
 
-function hash2d(x: number, y: number): number {
-  let n = (x * 374761393 + y * 668265263) ^ 0x5bd1e995;
-  n = (n ^ (n >>> 13)) * 1274126177;
-  return (n ^ (n >>> 16)) & 0xff;
-}
-
 function getChatboxBackdrop(): Uint8ClampedArray {
-  if (cachedBackdrop) return cachedBackdrop;
-
-  const w = CHATBOX_WIDTH;
-  const h = CHATBOX_HEIGHT;
-  const buf = new Uint8ClampedArray(w * h * 4);
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const idx = (y * w + x) * 4;
-      const distEdge = Math.min(x, y, w - 1 - x, h - 1 - y);
-
-      if (distEdge <= 5) {
-        // Authentic OSRS stone/wood beveled border around chatbox
-        const isTopLeft = x < 6 || y < 6;
-        let r = 82, g = 74, b = 61; // #524a3d
-        if (distEdge === 0 || distEdge === 5) {
-          r = 56; g = 48; b = 35; // #383023 dark outline
-        } else if (distEdge === 1) {
-          r = isTopLeft ? 132 : 70;
-          g = isTopLeft ? 120 : 62;
-          b = isTopLeft ? 100 : 50;
-        } else if (distEdge === 4) {
-          r = isTopLeft ? 64 : 112;
-          g = isTopLeft ? 56 : 100;
-          b = isTopLeft ? 44 : 82;
-        } else {
-          const grain = (hash2d(x, y) & 7) - 3;
-          r = 94 + grain;
-          g = 84 + grain;
-          b = 69 + grain;
-        }
-        buf[idx] = r;
-        buf[idx + 1] = g;
-        buf[idx + 2] = b;
-        buf[idx + 3] = 255;
-        continue;
-      }
-
-      // Inner bevel shadow
-      if (distEdge === 6) {
-        buf[idx] = 178;
-        buf[idx + 1] = 160;
-        buf[idx + 2] = 128;
-        buf[idx + 3] = 255;
-        continue;
-      }
-
-      // Authentic OSRS parchment tone (#d4c2a1 .. #c5b28e) with subtle warm paper mottling
-      const n1 = hash2d(x >> 2, y >> 2);
-      const n2 = hash2d(x, y);
-      const blotch = ((n1 - 128) >> 4) + ((n2 - 128) >> 5);
-      // Slight vignette darkening near edges
-      const edgeTint = distEdge < 14 ? -(14 - distEdge) * 0.7 : 0;
-      const delta = Math.round(blotch + edgeTint);
-
-      buf[idx] = Math.min(255, Math.max(0, 212 + delta));
-      buf[idx + 1] = Math.min(255, Math.max(0, 193 + delta));
-      buf[idx + 2] = Math.min(255, Math.max(0, 157 + Math.round(delta * 0.85)));
-      buf[idx + 3] = 255;
-    }
+  if (!cachedBackdrop) {
+    cachedBackdrop = decodeAuthenticChatboxBackdrop();
   }
-
-  cachedBackdrop = buf;
-  return buf;
+  return cachedBackdrop;
 }
 
 /**
@@ -109,22 +47,34 @@ export function renderChatbox(
   const w = CHATBOX_WIDTH;
   const h = CHATBOX_HEIGHT;
 
-  // Blit chathead into the authentic 96x96 Interface 231/217 slot (clipped to x: 19..114 or 402..497, y: 22..117)
+  // Blit chathead into the authentic 96x96 Interface 231/217 slot (clipped to x: 19..114 or 402..497, y: 23..118)
   if (chathead && options.layout !== 'none') {
     const slotX = options.layout === 'npc-left' ? 19 : 402;
-    const slotY = 22;
+    const slotY = 23;
     const nativeBoxSize = 96;
+    const slotOriginX = options.layout === 'npc-left' ? 49 : 47;
+    const slotOriginY = 53;
+    const hasOrigin =
+      chathead.originX !== undefined &&
+      chathead.originY !== undefined &&
+      chathead.scale !== undefined;
 
     const srcW = chathead.width;
     const srcH = chathead.height;
     for (let dy = 0; dy < nativeBoxSize; dy++) {
       const py = slotY + dy;
       if (py < 7 || py >= h - 7) continue;
-      const sy = Math.min(srcH - 1, Math.floor((dy * srcH) / nativeBoxSize));
+      const sy = hasOrigin
+        ? Math.floor(chathead.originY! + (dy - slotOriginY + 0.5) * chathead.scale!)
+        : Math.min(srcH - 1, Math.floor((dy * srcH) / nativeBoxSize));
+      if (sy < 0 || sy >= srcH) continue;
       for (let dx = 0; dx < nativeBoxSize; dx++) {
         const px = slotX + dx;
         if (px < 7 || px >= w - 7) continue;
-        const sx = Math.min(srcW - 1, Math.floor((dx * srcW) / nativeBoxSize));
+        const sx = hasOrigin
+          ? Math.floor(chathead.originX! + (dx - slotOriginX + 0.5) * chathead.scale!)
+          : Math.min(srcW - 1, Math.floor((dx * srcW) / nativeBoxSize));
+        if (sx < 0 || sx >= srcW) continue;
         const sIdx = (sy * srcW + sx) * 4;
         const sa = chathead.pixels[sIdx + 3];
         if (sa === 0) continue;
@@ -172,7 +122,7 @@ export function renderChatbox(
       h,
       options.speakerName.trim(),
       textCenterX,
-      22,
+      23,
       FONT_QUILL_8,
       nameColor,
       false
@@ -182,7 +132,7 @@ export function renderChatbox(
   // Dialogue Body Lines (231:6 / 217:6 -> fontId 497 q8_full, max 4 lines vertically centered)
   const lines = wrapBitmapText(options.dialogueText || '', FONT_QUILL_8, maxTextWidth).slice(0, 4);
   const stepY = lines.length >= 4 ? 16 : 20;
-  let lineY = Math.round(61 - ((lines.length - 1) * stepY) / 2);
+  let lineY = Math.round(62 - ((lines.length - 1) * stepY) / 2);
 
   for (const line of lines) {
     drawBitmapText(
@@ -208,7 +158,7 @@ export function renderChatbox(
       h,
       prompt,
       textCenterX,
-      102,
+      103,
       FONT_QUILL_8,
       promptColor,
       false

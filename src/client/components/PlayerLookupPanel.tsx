@@ -16,6 +16,7 @@ interface PlayerLookupPanelProps {
 interface HiscoresLookupResult {
   username: string;
   foundInHiscores: boolean;
+  networkError?: string | null;
   totalLevel: number | null;
   combatStats: Record<string, number> | null;
   appearanceNote: string;
@@ -172,7 +173,9 @@ export const PlayerLookupPanel: React.FC<PlayerLookupPanelProps> = ({
       setLookupStatus(
         data.foundInHiscores
           ? `Found "${data.username}" on OSRS Hiscores (Total Level ${data.totalLevel ?? '?'}). ${data.appearanceNote}`
-          : `"${data.username}" not found on live Hiscores (or offline). Applied seeded player look — customize hair, jaw, and headgear below.`
+          : data.networkError
+            ? `Hiscores unreachable from server (${data.networkError}). Applied seeded look for "${data.username}" — customize hair, jaw, and headgear below.`
+            : `"${data.username}" was not found on standard OSRS Hiscores. Applied seeded look — customize hair, jaw, and headgear below.`
       );
     } catch {
       onChangePlayerName(clean);

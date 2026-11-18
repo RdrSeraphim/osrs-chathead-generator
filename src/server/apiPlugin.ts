@@ -97,20 +97,68 @@ async function detectCandidateCacheDirs(): Promise<string[]> {
   return existing;
 }
 
+type PreviewVariant = 'regular' | 'full' | 'chatbox';
+
+interface StoredPreviewImage {
+  bytes: Uint8Array;
+  mime: 'image/gif' | 'image/png';
+  token: string;
+}
+
+const ALLOWED_PREVIEW_VARIANTS = new Set<PreviewVariant>(['regular', 'full', 'chatbox']);
+const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
+const MAX_PREVIEW_FILES = 60;
+const previewImages = new Map<PreviewVariant, StoredPreviewImage>();
+const previewFilesByName = new Map<string, { bytes: Uint8Array; mime: 'image/gif' | 'image/png' }>();
+
+function storePreviewFile(
+  filename: string,
+  file: { bytes: Uint8Array; mime: 'image/gif' | 'image/png' }
+): void {
+  if (!previewFilesByName.has(filename) && previewFilesByName.size >= MAX_PREVIEW_FILES) {
+    const oldest = previewFilesByName.keys().next().value;
+    if (oldest !== undefined) previewFilesByName.delete(oldest);
+  }
+  previewFilesByName.set(filename, file);
+}
+
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
   res.end(JSON.stringify(payload));
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+async function readRawBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) {
+      throw new Error(`Request body exceeded ${maxBytes} bytes.`);
+    }
+    chunks.push(buf);
   }
-  const text = Buffer.concat(chunks).toString('utf8').trim();
+  return Buffer.concat(chunks);
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const raw = await readRawBody(req, MAX_PREVIEW_BYTES);
+  const text = raw.toString('utf8').trim();
   if (!text) return {};
   return JSON.parse(text) as Record<string, unknown>;
+}
+
+function normalizeImageMime(raw: string | undefined | null): 'image/gif' | 'image/png' | null {
+  if (!raw) return null;
+  const base = raw.split(';')[0].trim().toLowerCase();
+  if (base === 'image/gif') return 'image/gif';
+  if (base === 'image/png') return 'image/png';
+  return null;
+}
+
+function parsePreviewVariant(raw: string): PreviewVariant | null {
+  return ALLOWED_PREVIEW_VARIANTS.has(raw as PreviewVariant) ? (raw as PreviewVariant) : null;
 }
 
 function serializeModel(m: ModelDef) {
@@ -241,7 +289,9 @@ export function osrsApiPlugin(): Plugin {
               [5892, 4], // TzRek-Jad
               [6632, 5], // General Graardor Jr.
               [2635, 6], // Bob
-              [3106, 7], // Man
+              [16895, 7], // Odd Old Man
+              [2875, 8], // Zeke
+              [3106, 9], // Man
             ]);
 
             const filtered: NpcDef[] = [];
@@ -351,6 +401,94 @@ export function osrsApiPlugin(): Plugin {
             return sendJson(res, 200, frame);
           }
 
+          if (pathname.startsWith('/api/preview-image/') && req.method === 'POST') {
+            const variant = parsePreviewVariant(pathname.slice('/api/preview-image/'.length));
+            if (!variant) {
+              return sendJson(res, 400, { error: 'Invalid preview variant.' });
+            }
+
+            const contentType = String(req.headers['content-type'] ?? '');
+            let token = url.searchParams.get('token')?.trim() ?? '';
+            let mime = normalizeImageMime(url.searchParams.get('mime') ?? contentType);
+            let bytes: Uint8Array;
+
+            if (contentType.toLowerCase().includes('application/json')) {
+              const body = await readJsonBody(req);
+              if (!token) token = String(body.token ?? '').trim();
+              if (!mime) mime = normalizeImageMime(typeof body.mime === 'string' ? body.mime : null);
+              const b64 = typeof body.base64 === 'string' ? body.base64 : '';
+              bytes = b64 ? Buffer.from(b64, 'base64') : new Uint8Array(0);
+            } else {
+              bytes = await readRawBody(req, MAX_PREVIEW_BYTES);
+            }
+
+            if (!mime) {
+              return sendJson(res, 400, { error: 'MIME must be image/gif or image/png.' });
+            }
+            if (bytes.length === 0) {
+              return sendJson(res, 400, { error: 'Image payload cannot be empty.' });
+            }
+            if (!token || !/^[a-zA-Z0-9_-]{1,64}$/.test(token)) {
+              token = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+            }
+
+            previewImages.set(variant, { bytes, mime, token });
+            const ext = mime === 'image/gif' ? 'gif' : 'png';
+            const filename = `osrs-${variant}-${token}.${ext}`;
+            storePreviewFile(filename, { bytes, mime });
+            return sendJson(res, 200, {
+              url: `/api/preview-image/${filename}`,
+              variant,
+              mime,
+              token,
+              bytes: bytes.length,
+            });
+          }
+
+          if (pathname.startsWith('/api/preview-image/') && (req.method === 'GET' || req.method === 'HEAD')) {
+            const namedMatch =
+              /^\/api\/preview-image\/(osrs-(?:regular|full|chatbox)-[a-zA-Z0-9_-]+\.(?:gif|png))$/.exec(
+                pathname
+              );
+            let entry: { bytes: Uint8Array; mime: 'image/gif' | 'image/png' } | null = null;
+            if (namedMatch) {
+              entry = previewFilesByName.get(namedMatch[1]) ?? null;
+            } else {
+              const variantMatch = /^\/api\/preview-image\/(regular|full|chatbox)\.(gif|png)$/.exec(pathname);
+              if (variantMatch) {
+                const variant = variantMatch[1] as PreviewVariant;
+                const ext = variantMatch[2] as 'gif' | 'png';
+                const expectedMime = ext === 'gif' ? 'image/gif' : 'image/png';
+                const stored = previewImages.get(variant);
+                if (stored && stored.mime === expectedMime) {
+                  entry = stored;
+                }
+              }
+            }
+
+            if (!entry) {
+              if (req.method === 'HEAD') {
+                res.statusCode = 404;
+                res.end();
+                return;
+              }
+              return sendJson(res, 404, { error: `Preview image not found: ${pathname}` });
+            }
+
+            res.statusCode = 200;
+            res.setHeader('Content-Type', entry.mime);
+            res.setHeader('Content-Length', String(entry.bytes.length));
+            res.setHeader('Cache-Control', 'public, max-age=3600, immutable');
+            res.setHeader('Accept-Ranges', 'bytes');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            if (req.method === 'HEAD') {
+              res.end();
+              return;
+            }
+            res.end(Buffer.from(entry.bytes));
+            return;
+          }
+
           if (pathname.startsWith('/api/player/lookup/') && req.method === 'GET') {
             const rawName = decodeURIComponent(pathname.slice('/api/player/lookup/'.length)).trim();
             if (!rawName || rawName.length > 12) {
@@ -383,31 +521,78 @@ async function handlePlayerLookup(res: ServerResponse, username: string): Promis
   }
   const absHash = Math.abs(hash);
 
+  interface ParsedHiscore {
+    username: string;
+    totalLevel: number | null;
+    combatStats: Record<string, number>;
+  }
+
+  let resolvedUsername = username;
   let foundInHiscores = false;
   let totalLevel: number | null = null;
   let combatStats: Record<string, number> | null = null;
-  let accountMode = 'Normal';
+  const accountMode = 'Normal';
+  let networkError: string | null = null;
 
-  try {
+  const headers = { 'User-Agent': 'OSRS-Chathead-Generator/1.0' };
+  const encodedName = encodeURIComponent(username);
+
+  const tryJsonHiscores = async (): Promise<ParsedHiscore | null> => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
-    const hsRes = await fetch(
-      `https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=${encodeURIComponent(username)}`,
-      { signal: controller.signal }
-    );
-    clearTimeout(timer);
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+      const hsRes = await fetch(
+        `https://secure.runescape.com/m=hiscore_oldschool/index_lite.json?player=${encodedName}`,
+        { signal: controller.signal, headers }
+      );
+      if (hsRes.status === 404) return null;
+      if (!hsRes.ok) throw new Error(`HTTP ${hsRes.status}`);
+      const json = (await hsRes.json()) as {
+        name?: string;
+        skills?: Array<{ id: number; name: string; level: number }>;
+      };
+      const skills = json.skills ?? [];
+      if (skills.length < 8) return null;
+      const byName = new Map(skills.map((s) => [s.name.toLowerCase(), s.level]));
+      return {
+        username: json.name || username,
+        totalLevel: byName.get('overall') ?? skills[0]?.level ?? null,
+        combatStats: {
+          attack: byName.get('attack') ?? skills[1]?.level ?? 1,
+          defence: byName.get('defence') ?? skills[2]?.level ?? 1,
+          strength: byName.get('strength') ?? skills[3]?.level ?? 1,
+          hitpoints: byName.get('hitpoints') ?? skills[4]?.level ?? 10,
+          ranged: byName.get('ranged') ?? skills[5]?.level ?? 1,
+          prayer: byName.get('prayer') ?? skills[6]?.level ?? 1,
+          magic: byName.get('magic') ?? skills[7]?.level ?? 1,
+        },
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
-    if (hsRes.ok) {
+  const tryWsHiscores = async (): Promise<ParsedHiscore | null> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+      const hsRes = await fetch(
+        `https://secure.runescape.com/m=hiscore_oldschool/index_lite.ws?player=${encodedName}`,
+        { signal: controller.signal, headers }
+      );
+      if (hsRes.status === 404) return null;
+      if (!hsRes.ok) throw new Error(`HTTP ${hsRes.status}`);
       const text = await hsRes.text();
       const lines = text.trim().split('\n');
-      if (lines.length >= 8) {
-        foundInHiscores = true;
-        const parseLevel = (idx: number) => {
-          const cols = lines[idx]?.split(',');
-          return cols && cols.length >= 2 ? Number(cols[1]) : 1;
-        };
-        totalLevel = parseLevel(0);
-        combatStats = {
+      if (lines.length < 8) return null;
+      const parseLevel = (idx: number) => {
+        const cols = lines[idx]?.split(',');
+        return cols && cols.length >= 2 ? Number(cols[1]) : 1;
+      };
+      return {
+        username,
+        totalLevel: parseLevel(0),
+        combatStats: {
           attack: parseLevel(1),
           defence: parseLevel(2),
           strength: parseLevel(3),
@@ -415,18 +600,37 @@ async function handlePlayerLookup(res: ServerResponse, username: string): Promis
           ranged: parseLevel(5),
           prayer: parseLevel(6),
           magic: parseLevel(7),
-        };
-      }
+        },
+      };
+    } finally {
+      clearTimeout(timer);
     }
-  } catch {
-    // Offline or timeout: keep local fallback cleanly
+  };
+
+  try {
+    const parsed = (await tryJsonHiscores()) ?? (await tryWsHiscores());
+    if (parsed) {
+      resolvedUsername = parsed.username;
+      foundInHiscores = true;
+      totalLevel = parsed.totalLevel;
+      combatStats = parsed.combatStats;
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const cause =
+      err && typeof err === 'object' && 'cause' in err && err.cause instanceof Error
+        ? ` (${err.cause.message})`
+        : '';
+    networkError = `${msg}${cause}`;
   }
 
   // Suggest sensible iconic headgear based on stats/name when available, editable in UI
   let suggestedHelmId: number | null = null;
-  const lower = username.toLowerCase();
+  const lower = resolvedUsername.toLowerCase();
   if (lower.includes('zezima') || lower.includes('wise')) {
     suggestedHelmId = 1042; // Blue partyhat
+  } else if (lower.includes('seraphim irl')) {
+    suggestedHelmId = 10828;
   } else if (combatStats && combatStats.defence >= 60 && combatStats.attack >= 60) {
     suggestedHelmId = 1149; // Dragon med helm
   } else if (combatStats && combatStats.magic >= 50) {
@@ -434,8 +638,9 @@ async function handlePlayerLookup(res: ServerResponse, username: string): Promis
   }
 
   return sendJson(res, 200, {
-    username,
+    username: resolvedUsername,
     foundInHiscores,
+    networkError,
     accountMode,
     totalLevel,
     combatStats,

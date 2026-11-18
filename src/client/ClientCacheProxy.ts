@@ -117,6 +117,7 @@ export class ServerCacheProxy implements UnifiedCache {
   private itemCache = new Map<number, ItemDef>();
   private modelCache = new Map<number, ModelDef>();
   private frameCache = new Map<string, FrameDef>();
+  private frameInFlight = new Map<string, Promise<FrameDef | undefined>>();
   private kitsList: KitDef[] | null = null;
   private seqEntries: CompatibleSeqEntry[] | null = null;
 
@@ -256,11 +257,23 @@ export class ServerCacheProxy implements UnifiedCache {
     const key = `${archiveId}:${fileId}`;
     const cached = this.frameCache.get(key);
     if (cached) return cached;
-    const res = await fetch(`/api/cache/frame/${archiveId}/${fileId}`);
-    if (!res.ok) return undefined;
-    const frame = (await res.json()) as FrameDef;
-    this.frameCache.set(key, frame);
-    return frame;
+    const inflight = this.frameInFlight.get(key);
+    if (inflight) return inflight;
+
+    const req = (async () => {
+      try {
+        const res = await fetch(`/api/cache/frame/${archiveId}/${fileId}`);
+        if (!res.ok) return undefined;
+        const frame = (await res.json()) as FrameDef;
+        this.frameCache.set(key, frame);
+        return frame;
+      } finally {
+        this.frameInFlight.delete(key);
+      }
+    })();
+
+    this.frameInFlight.set(key, req);
+    return req;
   }
 
   async getFramemap(_id: number): Promise<FramemapDef | undefined> {
