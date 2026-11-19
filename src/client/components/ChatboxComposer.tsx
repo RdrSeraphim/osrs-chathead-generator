@@ -510,7 +510,7 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
               <img
                 src={regularPreviewUrl}
                 className="pixel-canvas"
-                style={{ maxWidth: 192, maxHeight: 192, width: 'auto', height: 'auto' }}
+                style={{ maxWidth: 'min(100%, 192px)', maxHeight: 192, width: 'auto', height: 'auto' }}
                 alt="Regular 96x96 slot OSRS chathead preview"
               />
             ) : (
@@ -550,7 +550,7 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
                 <img
                   src={fullPreviewUrl}
                   className="pixel-canvas"
-                  style={{ maxWidth: 220, maxHeight: 300, width: 'auto', height: 'auto' }}
+                  style={{ maxWidth: 'min(100%, 220px)', maxHeight: 300, width: 'auto', height: 'auto' }}
                   alt="Full unclipped OSRS chathead preview"
                 />
               )}
@@ -582,10 +582,9 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
         {chatboxPreviewUrl && (
           <img
             src={chatboxPreviewUrl}
-            className="pixel-canvas"
+            className="pixel-canvas chatbox-preview"
             width={519}
             height={142}
-            style={{ width: 519, height: 142 }}
             alt="Rendered OSRS dialogue chatbox preview"
           />
         )}
@@ -739,7 +738,7 @@ export const ChatboxComposer: React.FC<ChatboxComposerProps> = ({
                     alt=""
                     width={40}
                     height={40}
-                    style={{ imageRendering: 'pixelated' }}
+                    style={{ imageRendering: 'pixelated', flexShrink: 0 }}
                   />
                 )}
                 <div>
